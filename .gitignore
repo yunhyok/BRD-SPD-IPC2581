@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+output/
+investigation/
+local-test/
+*.log
+*.brd
+*.spd
+*.xml
+*.sqlite*
+!tests/fixtures/*.spd
+!tests/fixtures/*.xml
+*.egg-info/
+*.spec
