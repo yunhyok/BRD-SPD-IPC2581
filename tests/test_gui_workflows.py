@@ -9,6 +9,31 @@ from brd_spd.remote import AgentConfig
 from test_integration import ProcessSimulator, SOURCE
 
 
+@pytest.mark.parametrize("module_name", ["gui", "agent_gui"])
+def test_actual_entrypoint_initializes_font_and_window(tmp_path, monkeypatch, module_name):
+    from importlib import import_module
+    module = import_module("brd_spd." + module_name)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "settings"))
+    original = tk.Tk
+    roots = []
+    def hidden_root():
+        try:
+            root = original()
+        except tk.TclError:
+            pytest.skip("Tk display unavailable")
+        root.withdraw()
+        root.after(50, root.quit)
+        roots.append(root)
+        return root
+    monkeypatch.setattr(tk, "Tk", hidden_root)
+    try:
+        module.main()
+        assert roots
+    finally:
+        for root in roots:
+            root.destroy()
+
+
 @pytest.fixture
 def ui(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path / "settings"))

@@ -205,7 +205,7 @@ class AgentConsoleApp(ttk.Frame):
 def main() -> None:
     root = tk.Tk()
     try:
-        root.option_add("*Font", "Malgun Gothic 10")
+        root.option_add("*Font", "{Malgun Gothic} 10")
     except tk.TclError:
         pass
     AgentConsoleApp(root)
