@@ -24,7 +24,7 @@ jobs:
         run: choco install innosetup --no-progress -y
       - name: Build installer
         shell: powershell
-        run: .\build.ps1 -Version 0.4.1
+        run: .\build.ps1 -Version 0.5.0
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:

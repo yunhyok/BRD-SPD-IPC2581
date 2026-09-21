@@ -48,7 +48,7 @@
 <body>
   <a class="skip" href="#overview">본문으로 건너뛰기</a>
   <header>
-    <div class="version">버전 0.4.1 · 내장 오프라인 도움말 · Windows</div>
+    <div class="version">버전 0.5.0 · 내장 오프라인 도움말 · Windows</div>
     <h1>BRD-SPD-IPC2581<br>Allegro plane 반영 안내</h1>
     <p>SPD의 선택된 plane 형상을 기존 Allegro 보드에 반영하는 작업을 준비하고, 실행하고, 결과를 확인하는 방법입니다.</p>
   </header>
@@ -70,17 +70,18 @@
       <section id="overview">
         <h2>시작하기</h2>
         <p class="lead">이 프로그램은 일반적인 SPD를 완전한 BRD로 재구성하지 않습니다. 같은 보드의 기존 BRD를 기준으로, 선택한 레이어와 net의 <strong>plane 형상</strong>을 반영해 별도의 결과 BRD를 만듭니다.</p>
-        <p><strong>Help / 도움말</strong> 또는 <strong>F1</strong>은 이 안내를 프로그램 안의 내장 뷰어로 엽니다. Chrome, Edge, WebView2 또는 인터넷 설치는 필요하지 않습니다. 상단 목차, 문서 내 링크와 글자 축소/확대 기능을 사용할 수 있습니다.</p>
+        <p><strong>Help / 도움말</strong> 메뉴는 원하는 주제를, <strong>F1</strong>은 현재 선택한 역할에 맞는 안내를 프로그램 안의 내장 뷰어로 엽니다. Chrome, Edge, WebView2 또는 인터넷 설치는 필요하지 않습니다. 상단 목차, 문서 내 링크와 글자 축소/확대 기능을 사용할 수 있습니다.</p>
         <div class="callout"><strong>실행 전 준비:</strong> 원본 BRD와 수정 SPD가 같은 보드인지 확인하고, 원본을 별도로 보관하세요. 결과 BRD는 Allegro에서 열어 plane, void, net, DRC를 검토해야 합니다. 실행 직전에 SPD 수정 여부를 다시 확인한 뒤 출력 폴더의 상위 경로에 임시 SPD 사본을 만들고, 작업이 끝나면 제거합니다. 작업 중 필요한 사본 공간도 확보하세요.</div>
         <div class="flow" aria-label="작업 흐름"><div>수정 SPD</div><i>↓</i><div>선택한 작업 방식</div><i>↓</i><div>결과 BRD와 로그 검토</div></div>
-        <p>메인 앱에는 <strong>Native SKILL 생성</strong>과 <strong>원격 Allegro 작업</strong> 탭이 있습니다. 두 탭 모두 SPD를 먼저 불러와야 대상 선택과 실행을 할 수 있습니다. IPC-2581 변환 기능은 현재 UI와 CLI에서 비활성화되어 있으며, 기존 백엔드 파일이 남아 있더라도 이 도움말의 작업 흐름에는 사용하지 않습니다.</p>
+        <p>Setup 설치 파일로 같은 <strong>BRD-SPD-IPC2581.exe</strong>를 노트북과 워크스테이션에 설치합니다. 앱은 처음에 <strong>원격 Allegro 작업</strong> 탭을 열며, 그 탭의 역할을 먼저 선택합니다. <strong>노트북 (작업 요청)</strong>은 원격 작업을 보내고, <strong>워크스테이션 (Allegro 실행)</strong>은 Agent를 실행합니다. 역할 선택만으로 Agent가 시작되지는 않습니다.</p>
+        <p>Native SKILL은 노트북 역할에서 사용할 수 있습니다. 워크스테이션 역할에서는 Native SKILL 탭이 비활성화되며, 사용하려면 먼저 노트북 역할로 전환합니다. IPC-2581 변환 기능은 현재 UI와 CLI에서 비활성화되어 있습니다.</p>
       </section>
 
       <section id="choose-workflow">
         <h2>작업 방식 선택</h2>
         <div class="grid">
           <article class="card"><span class="tag">파일 생성만</span><h3>Native SKILL 생성</h3><p>노트북 또는 어느 PC에서나 SPD를 읽어 SKILL 번들을 만듭니다. 이 단계에서는 Allegro를 실행하지 않고 라이선스도 사용하지 않으며, <strong>PID가 필요 없습니다.</strong></p><p>생성한 폴더를 라이선스 있는 워크스테이션으로 복사한 뒤 사용자가 명령을 실행합니다.</p></article>
-          <article class="card"><span class="tag">원격 실행·회수</span><h3>원격 Allegro 작업</h3><p>워크스테이션에서 Agent를 수동 시작하고, 노트북 앱이 인증된 연결로 파일을 전송합니다. Agent가 Allegro 실행 또는 선택한 기존 세션 제어와 결과 ZIP 회수를 담당합니다.</p><p>실행 PC에 Allegro 24.1과 라이선스가 있어야 합니다.</p></article>
+          <article class="card"><span class="tag">원격 실행·회수</span><h3>원격 Allegro 작업</h3><p>노트북 역할은 인증된 연결로 파일을 전송합니다. 워크스테이션 역할은 같은 메인 앱 안에서 Agent를 수동 시작하여 Allegro 실행 또는 기존 세션 제어와 결과 ZIP 회수를 담당합니다.</p><p>실행 PC에 Allegro 24.1과 라이선스가 있어야 합니다.</p></article>
         </div>
         <div class="callout ok"><strong>선택 기준:</strong> 네트워크를 쓰지 않고 검토 가능한 스크립트만 원하면 Native SKILL을, 노트북에서 작업 상태·로그·결과 ZIP을 관리하려면 원격 Allegro 작업을 사용합니다.</div>
       </section>
@@ -130,8 +131,8 @@
       </section>
 
       <section id="workstation">
-        <h2>워크스테이션 Agent 시작</h2>
-        <p class="lead">라이선스와 Allegro가 설치된 Windows 워크스테이션에서만 <strong>BRD-SPD Workstation Agent</strong>를 수동 실행합니다. 설치 프로그램이나 Agent는 방화벽 규칙과 자동 시작 설정을 바꾸지 않습니다.</p>
+        <h2>워크스테이션 역할과 Agent 시작</h2>
+        <p class="lead">라이선스와 Allegro가 설치된 Windows 워크스테이션에서 메인 앱의 <strong>워크스테이션 (Allegro 실행)</strong> 역할을 선택합니다. 같은 화면에 Agent 설정과 시작/중지 기능이 나타납니다. 역할 선택은 Agent를 시작하지 않으므로, 설정을 검토한 뒤 직접 <strong>Agent 시작</strong>을 누릅니다.</p>
         <ol class="steps">
           <li><strong>바인드 주소</strong>를 정합니다. 모든 네트워크 인터페이스에서 받으려면 <code>0.0.0.0</code>을 입력합니다. 이것은 Agent가 듣는 주소이며, 노트북에 입력하는 주소가 아닙니다.</li>
           <li><strong>포트</strong>는 기본값 <code>8765</code>를 사용하거나 조직 정책에 맞는 값을 지정합니다.</li>
@@ -140,6 +141,7 @@
           <li><strong>작업 폴더</strong>는 Agent가 전송 파일과 작업 결과를 보관할 로컬 폴더입니다. 결과와 백업, 로그를 둘 충분한 디스크 공간을 확보합니다.</li>
           <li><strong>Agent 시작</strong>을 누릅니다. 표시되는 <strong>토큰</strong>과 <strong>인증서 지문</strong>을 노트북에 안전하게 옮깁니다. 토큰은 클라이언트에 저장되지 않으므로 앱을 다시 열면 다시 붙여 넣습니다.</li>
         </ol>
+        <p><strong>BRD-SPD-IPC2581 Workstation Agent</strong> 별도 실행 파일도 계속 사용할 수 있습니다. 기존 설정과 연결 방식은 호환됩니다.</p>
         <div class="callout"><strong>노트북에 넣을 IP:</strong> 예를 들어 Agent가 <code>0.0.0.0</code>에 바인드되어도 노트북의 <strong>워크스테이션 IP</strong>에는 실제 워크스테이션의 연결 가능한 주소를 입력합니다. 문서 예시 주소는 <code>192.0.2.16</code>이며 실제 환경 주소가 아닙니다.</div>
       </section>
 
@@ -155,6 +157,7 @@
           <tr><th>대상 레이어 (빈칸: 전체) / 대상 NET (빈칸: 전체)</th><td><a href="#target-selection">목록에서 선택…</a>으로 선택 범위를 정하는 것을 권장합니다. 직접 쉼표 입력과 CSV 따옴표도 가능하며, 빈칸이면 지원되는 SPD plane 전체입니다.</td></tr>
         </tbody></table>
         <ol class="steps">
+          <li>먼저 <strong>노트북 (작업 요청)</strong> 역할을 선택합니다.</li>
           <li><strong>연결 확인</strong>으로 토큰, 인증서, 네트워크 상태를 먼저 확인합니다. 이는 SPD를 불러오기 전에도 할 수 있습니다.</li>
           <li><strong>SPD 입력</strong>에서 <strong>찾아보기…</strong>로 선택하거나 경로 입력 뒤 <strong>SPD 불러오기</strong>를 누릅니다. 성공한 뒤에만 범위, 부품 옵션, <strong>전송 및 실행</strong>이 활성화됩니다.</li>
           <li>필드를 채운 뒤 <strong>전송 및 실행</strong>을 누릅니다. 업로드와 실행 상태는 <strong>원격 작업 로그</strong>에서 봅니다.</li>
@@ -166,6 +169,7 @@
         <h2>원격 작업: 기존 Allegro PID</h2>
         <p class="lead">현재 열려 있는 설계에 반영하려면 워크스테이션의 Allegro PID를 명시합니다. PID는 PowerSI나 노트북 프로세스의 PID가 아니라 <strong>워크스테이션 작업 관리자의 <code>allegro.exe</code> PID</strong>입니다.</p>
         <ol class="steps">
+          <li>먼저 <strong>노트북 (작업 요청)</strong> 역할을 선택합니다.</li>
           <li>워크스테이션에서 대상 BRD를 Allegro로 열고, 진행 중인 명령과 모달 대화상자를 모두 마칩니다. 작업 중에는 그 창을 직접 편집하지 마세요.</li>
           <li>작업 관리자의 <strong>세부 정보</strong>에서 대상 <code>allegro.exe</code> PID를 확인합니다.</li>
           <li>노트북 앱의 <strong>Allegro PID (빈칸: 새 실행)</strong>에 양의 정수를 입력하고 <strong>PID 확인</strong>을 누릅니다. 표시된 실행 파일과 생성 시각이 의도한 창인지 확인합니다.</li>
@@ -191,6 +195,7 @@
 
       <section id="troubleshooting">
         <h2>문제 해결</h2>
+        <h3>역할을 바꿀 수 없습니다</h3><p>노트북 역할에서 원격 작업, Native SKILL 생성, SPD 로딩 또는 레이어/NET 목록 선택 창이 진행 중이면 역할을 바꿀 수 없습니다. 작업 또는 로딩이 끝나고 목록 선택 창을 닫은 뒤 다시 시도하세요. 워크스테이션 역할에서 Agent가 실행 중이면 먼저 <strong>Agent 중지</strong>를 눌러야 역할을 바꿀 수 있습니다. 마지막으로 선택한 역할은 다음 실행에도 유지됩니다.</p>
         <h3>레이어/NET 입력이나 실행 버튼이 비활성화되어 있습니다</h3><p>SPD를 아직 읽지 않았거나, 경로를 바꾼 뒤 다시 읽지 않은 상태입니다. <strong>찾아보기…</strong>로 파일을 고르면 자동으로 읽고, 직접 입력하거나 저장된 경로라면 <strong>SPD 불러오기</strong>를 누릅니다. 큰 파일은 로딩이 끝날 때까지 기다립니다. 새 SPD 경로를 지정하면 레이어, NET, 부품 위치/회전 선택이 초기화되므로 목록에서 다시 선택합니다.</p>
         <h3>연결 확인에 실패합니다</h3><p>워크스테이션 Agent가 실행 중인지, 노트북에는 실제 워크스테이션 IP와 포트가 입력됐는지 확인합니다. <code>0.0.0.0</code>은 Agent 바인드 주소이지 노트북 입력값이 아닙니다. 허용 클라이언트 IP를 썼다면 현재 노트북 IP도 목록에 넣습니다. 조직 정책으로 포트 통신이 차단되면 해당 정책에 따라 허용해야 합니다.</p>
         <h3>PID 확인 또는 PID 실행이 거부됩니다</h3><p>워크스테이션의 대상 <code>allegro.exe</code> PID인지, Agent와 Allegro가 같은 Windows 로그인 세션 및 권한 수준인지 확인합니다. 창이 여러 개이거나 PID가 종료·재사용된 경우에는 새 PID를 입력해 다시 확인합니다.</p>

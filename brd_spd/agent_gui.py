@@ -21,8 +21,9 @@ DEFAULT_ALLEGRO = r"C:\Cadence\SPB_24.1\tools\bin\allegro.exe"
 class AgentConsoleApp(ttk.Frame):
     """Start and stop the HTTPS agent explicitly; it never changes firewall settings."""
 
-    def __init__(self, master: tk.Tk) -> None:
+    def __init__(self, master: tk.Misc, *, standalone: bool = True) -> None:
         super().__init__(master, padding=16)
+        self.standalone = standalone
         persisted = load_settings()
         self.host_var = tk.StringVar(value=persisted.get("agent_host", "0.0.0.0"))
         self.port_var = tk.StringVar(value=persisted.get("agent_port", "8765"))
@@ -36,21 +37,35 @@ class AgentConsoleApp(ttk.Frame):
         self._agent: Any = None
         self._busy = False
         self._closing = False
+        self._destroyed = False
+        self._after_id: str | None = None
+        self._config_controls: list[tk.Widget] = []
         self._build()
+        if standalone:
+            self._configure_standalone(master)
+        self.bind("<Destroy>", self._destroyed_event, add="+")
+        self._sync_controls()
+        self._after_id = self.after(100, self._drain_events)
+
+    @property
+    def can_switch_role(self) -> bool:
+        """Whether an embedding container may safely discard this idle pane."""
+        return not self._busy and self._agent is None and not self._closing
+
+    def _configure_standalone(self, master: tk.Misc) -> None:
+        master.title(f"{APP_NAME} Workstation Agent")
+        master.minsize(690, 470)
+        master.columnconfigure(0, weight=1)
+        master.rowconfigure(0, weight=1)
+        self.grid(sticky="nsew")
         self._menu, self._help_menu = install_help_menu(master, lambda: "workstation")
-        self.master.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._drain_events)
+        master.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
-        self.master.title(f"{APP_NAME} Workstation Agent")
-        self.master.minsize(690, 470)
-        self.master.columnconfigure(0, weight=1)
-        self.master.rowconfigure(0, weight=1)
-        self.grid(sticky="nsew")
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(9, weight=1)
-        ttk.Label(self, text="Allegro 워크스테이션 Agent", font=("Malgun Gothic", 15, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        ttk.Label(self, text="라이선스가 있는 워크스테이션에서만 수동으로 시작합니다. 방화벽·자동 시작은 변경하지 않습니다.", foreground="#8a4b00", wraplength=640).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        if self.standalone:
+            ttk.Label(self, text="Allegro 워크스테이션 Agent", font=("Malgun Gothic", 15, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            ttk.Label(self, text="라이선스가 있는 워크스테이션에서만 수동으로 시작합니다. 방화벽·자동 시작은 변경하지 않습니다.", foreground="#8a4b00", wraplength=640).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
         self._row(2, "바인드 주소", self.host_var)
         self._row(3, "포트", self.port_var)
         self._row(4, "허용 클라이언트 IP (선택)", self.allowed_var)
@@ -80,12 +95,17 @@ class AgentConsoleApp(ttk.Frame):
 
     def _row(self, row: int, label: str, variable: tk.StringVar) -> None:
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(self, textvariable=variable).grid(row=row, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+        entry = ttk.Entry(self, textvariable=variable)
+        entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+        self._config_controls.append(entry)
 
     def _file_row(self, row: int, label: str, variable: tk.StringVar, command: Any, types: list[tuple[str, str]]) -> None:
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(self, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=10, pady=3)
-        ttk.Button(self, text="찾아보기…", command=command).grid(row=row, column=2)
+        entry = ttk.Entry(self, textvariable=variable)
+        entry.grid(row=row, column=1, sticky="ew", padx=10, pady=3)
+        browse = ttk.Button(self, text="찾아보기…", command=command)
+        browse.grid(row=row, column=2)
+        self._config_controls.extend((entry, browse))
 
     def _folder_row(self, row: int, label: str, variable: tk.StringVar, command: Any) -> None:
         self._file_row(row, label, variable, command, [])
@@ -100,8 +120,16 @@ class AgentConsoleApp(ttk.Frame):
         if path:
             self.workdir_var.set(path)
 
+    def _sync_controls(self) -> None:
+        editable = not self._busy and self._agent is None and not self._closing
+        for widget in self._config_controls:
+            widget.configure(state="normal" if editable else "disabled")
+        self.start_button.configure(state="normal" if editable else "disabled")
+        can_stop = self._agent is not None and not self._busy
+        self.stop_button.configure(state="normal" if can_stop else "disabled")
+
     def _start(self) -> None:
-        if self._busy or self._agent is not None:
+        if self._closing or self._busy or self._agent is not None:
             return
         try:
             port = int(self.port_var.get().strip())
@@ -116,8 +144,8 @@ class AgentConsoleApp(ttk.Frame):
         datadir = Path(self.workdir_var.get().strip())
         host = self.host_var.get().strip()
         self._busy = True
-        self.start_button.configure(state="disabled")
         self.status_var.set("시작 중…")
+        self._sync_controls()
         def worker() -> None:
             try:
                 from brd_spd.remote import AgentConfig, WorkstationAgent
@@ -127,7 +155,7 @@ class AgentConsoleApp(ttk.Frame):
                 info = agent.start()
                 self._events.put(("started", (agent, info)))
             except Exception as exc:
-                self._events.put(("error", (str(exc), traceback.format_exc())))
+                self._events.put(("error", ("start", str(exc), traceback.format_exc())))
         threading.Thread(target=worker, daemon=True).start()
 
     def _stop(self, closing: bool = False) -> None:
@@ -135,28 +163,42 @@ class AgentConsoleApp(ttk.Frame):
         if self._agent is None or self._busy:
             return
         self._busy = True
-        self.stop_button.configure(state="disabled")
         self.status_var.set("중지 중…")
+        self._sync_controls()
+        agent = self._agent
         def worker() -> None:
             try:
-                self._agent.stop()
+                agent.stop()
                 self._events.put(("stopped", None))
             except Exception as exc:
-                self._events.put(("error", (str(exc), traceback.format_exc())))
+                self._events.put(("error", ("stop", str(exc), traceback.format_exc())))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_close(self) -> None:
         """Stop the agent first so closing the GUI cannot orphan an Allegro process."""
         self._closing = True
         self.status_var.set("종료 중: Agent를 안전하게 중지합니다…")
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="disabled")
+        self._sync_controls()
         if self._agent is not None:
             self._stop(closing=True)
         elif not self._busy:
-            self.master.destroy()
+            self._destroy_toplevel()
+
+    def _destroy_toplevel(self) -> None:
+        if self._destroyed:
+            return
+        self._destroyed = True
+        try:
+            self.winfo_toplevel().destroy()
+        except tk.TclError:
+            pass
+
+    def _destroyed_event(self, event: tk.Event) -> None:
+        if event.widget == self:
+            self._destroyed = True
 
     def _drain_events(self) -> None:
+        self._after_id = None
         try:
             while True:
                 kind, payload = self._events.get_nowait()
@@ -167,8 +209,8 @@ class AgentConsoleApp(ttk.Frame):
                     self.fingerprint_var.set(str(info.get("fingerprint", "")))
                     self._write_log("Agent 시작: " + str(info))
                     self.status_var.set(f"실행 중: {info.get('host')}:{info.get('port')}")
-                    self.stop_button.configure(state="normal")
                     save_settings({"agent_host": self.host_var.get(), "agent_port": self.port_var.get(), "agent_allowed_clients": self.allowed_var.get(), "agent_allegro_exe": self.exe_var.get(), "agent_workdir": self.workdir_var.get()})
+                    self._sync_controls()
                     if self._closing:
                         self._stop(closing=True)
                 elif kind == "stopped":
@@ -178,24 +220,37 @@ class AgentConsoleApp(ttk.Frame):
                     self.fingerprint_var.set("")
                     self._write_log("Agent 중지됨")
                     self.status_var.set("중지됨")
-                    self.start_button.configure(state="normal")
+                    self._sync_controls()
                     if self._closing:
-                        self.master.destroy()
+                        self._destroy_toplevel()
                 elif kind == "error":
-                    message, details = payload
+                    operation, message, details = payload
                     self._busy = False
                     self._write_log("오류: " + message)
                     self._write_log(details)
-                    self.status_var.set("오류")
-                    self.start_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled")
-                    if self._closing:
-                        self.master.destroy()
+                    if operation == "stop" and self._agent is not None:
+                        self.status_var.set("중지 실패 · Agent 실행 상태 유지")
+                        self._sync_controls()
+                        messagebox.showerror(
+                            APP_NAME,
+                            "Agent 중지에 실패했습니다. 창을 닫지 않았습니다. "
+                            f"상태를 확인한 뒤 다시 중지하세요.\n\n{message}",
+                            parent=self,
+                        )
                     else:
-                        messagebox.showerror(APP_NAME, f"Agent 작업에 실패했습니다.\n\n{message}")
+                        self.status_var.set("시작 실패")
+                        self._sync_controls()
+                        if self._closing:
+                            self._destroy_toplevel()
+                        else:
+                            messagebox.showerror(
+                                APP_NAME, f"Agent 시작에 실패했습니다.\n\n{message}",
+                                parent=self,
+                            )
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+        if not self._destroyed:
+            self._after_id = self.after(100, self._drain_events)
 
     def _write_log(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -210,5 +265,5 @@ def main() -> None:
         root.option_add("*Font", "{Malgun Gothic} 10")
     except tk.TclError:
         pass
-    AgentConsoleApp(root)
+    AgentConsoleApp(root, standalone=True)
     root.mainloop()

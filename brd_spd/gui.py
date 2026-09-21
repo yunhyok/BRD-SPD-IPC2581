@@ -367,8 +367,9 @@ class ConverterApp(ttk.Frame):
 class RemoteClientPane(ttk.Frame):
     """Client for the separate workstation agent. All network I/O runs on a worker."""
 
-    def __init__(self, master: ttk.Notebook) -> None:
+    def __init__(self, master: tk.Misc, *, show_heading: bool = True) -> None:
         super().__init__(master, padding=16)
+        self._show_heading = show_heading
         persisted = load_settings()
         self.host_var = tk.StringVar(value=persisted.get("remote_host", "127.0.0.1"))
         self.port_var = tk.StringVar(value=persisted.get("remote_port", "8765"))
@@ -395,13 +396,10 @@ class RemoteClientPane(ttk.Frame):
 
     def _build(self) -> None:
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(8, weight=1)
-        ttk.Label(self, text="원격 Allegro 24.1 작업", font=("Malgun Gothic", 15, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
-        )
-        ttk.Label(self, text="PID 입력시 해당 Allegro에 열린 BRD를 사용합니다. 빈칸이면 원본 BRD를 업로드합니다. Plane 반영 중심의 결과이므로 최종 BRD 검토가 필요합니다.", foreground="#8a4b00", wraplength=720).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(0, 10)
-        )
+        if self._show_heading:
+            ttk.Label(self, text="원격 Allegro 24.1 작업", font=("Malgun Gothic", 15, "bold")).grid(
+                row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
+            )
         self._row(2, "워크스테이션 IP", self.host_var)
         self._row(3, "포트", self.port_var)
         self._row(4, "접속 토큰", self.token_var, show="•")
@@ -432,14 +430,13 @@ class RemoteClientPane(ttk.Frame):
         self.cancel_button = ttk.Button(controls, text="취소", command=self._cancel, state="disabled")
         self.cancel_button.grid(row=0, column=3, padx=(0, 10))
         ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=4, sticky="w")
-        self.rowconfigure(16, weight=1)
         ttk.Label(self, text="원격 작업 로그").grid(row=16, column=0, columnspan=3, sticky="w")
         frame = ttk.Frame(self)
         frame.grid(row=17, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
         self.rowconfigure(17, weight=1)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.log = tk.Text(frame, height=12, wrap="word", state="disabled", font=("Consolas", 10))
+        self.log = tk.Text(frame, height=7, wrap="word", state="disabled", font=("Consolas", 10))
         scrollbar = ttk.Scrollbar(frame, command=self.log.yview)
         self.log.configure(yscrollcommand=scrollbar.set)
         self.log.grid(row=0, column=0, sticky="nsew")
@@ -935,6 +932,94 @@ class SkillPane(ttk.Frame):
         self.log.configure(state="disabled")
 
 
+class RemoteWorkPane(ttk.Frame):
+    """Show one computer's role while reusing the existing client and agent."""
+
+    def __init__(self, master: ttk.Notebook, skill: SkillPane) -> None:
+        super().__init__(master)
+        self.skill = skill
+        saved_role = load_settings().get("remote_role", "laptop")
+        self.role = saved_role if saved_role in ("laptop", "workstation") else "laptop"
+        self.role_var = tk.StringVar(value=self.role)
+        self.hint_var = tk.StringVar()
+        self.lock_var = tk.StringVar()
+        self.agent = None
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        header = ttk.Frame(self, padding=(16, 12, 16, 0))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="이 컴퓨터의 역할", font=("Malgun Gothic", 12, "bold")).grid(sticky="w")
+        choices = ttk.Frame(header)
+        choices.grid(sticky="w", pady=(6, 4))
+        self.role_buttons = []
+        for column, (value, label) in enumerate((
+            ("laptop", "노트북 (작업 요청)"),
+            ("workstation", "워크스테이션 (Allegro 실행)"),
+        )):
+            button = ttk.Radiobutton(choices, text=label, value=value, variable=self.role_var,
+                                     command=self._select_role)
+            button.grid(row=0, column=column, padx=(0, 24))
+            self.role_buttons.append(button)
+        ttk.Label(header, textvariable=self.hint_var, wraplength=740).grid(sticky="w")
+        ttk.Label(header, textvariable=self.lock_var, foreground="#8a4b00", wraplength=740).grid(sticky="w")
+        self.client = RemoteClientPane(self, show_heading=False)
+        self._show_role()
+        self._timer = self.after(100, self._refresh_roles)
+        self.bind("<Destroy>", self._destroy, add="+")
+
+    def _busy_reason(self) -> str:
+        if self.agent is not None and not self.agent.can_switch_role:
+            return "역할을 바꾸려면 Agent 중지를 완료하세요."
+        for pane in (self.client, self.skill):
+            if pane._running or pane.spd_loading.loading or getattr(pane, "_picker_active", False):
+                return "작업·SPD 로딩·목록 선택이 끝나면 역할을 바꿀 수 있습니다."
+        return ""
+
+    def _refresh_roles(self) -> None:
+        reason = self._busy_reason()
+        self.lock_var.set(reason)
+        for button in self.role_buttons:
+            button.configure(state="disabled" if reason else "normal")
+        self._timer = self.after(100, self._refresh_roles)
+
+    def _select_role(self) -> None:
+        selected = self.role_var.get()
+        reason = self._busy_reason()
+        if reason or selected not in ("laptop", "workstation"):
+            self.role_var.set(self.role)
+            self.lock_var.set(reason)
+            return
+        self.role = selected
+        self._show_role()
+        save_settings({"remote_role": self.role})
+        self.event_generate("<<RemoteRoleChanged>>")
+
+    def _show_role(self) -> None:
+        if self.role == "workstation":
+            if self.agent is None:
+                from .agent_gui import AgentConsoleApp
+                self.agent = AgentConsoleApp(self, standalone=False)
+            self.client.grid_remove()
+            self.agent.grid(row=1, column=0, sticky="nsew")
+            self.hint_var.set("Allegro가 설치된 컴퓨터입니다. 아래 설정으로 Agent를 시작하고, 표시된 토큰과 인증서 지문을 노트북에 입력하세요.")
+        else:
+            if self.agent is not None:
+                self.agent.grid_remove()
+            self.client.grid(row=1, column=0, sticky="nsew")
+            self.hint_var.set("SPD를 보내고 결과·로그를 받는 컴퓨터입니다. 워크스테이션에서 Agent를 시작한 뒤 아래 연결 정보를 입력하세요.")
+
+    def help_topic(self) -> str:
+        if self.role == "workstation":
+            return "workstation"
+        return "remote-pid" if self.client.pid_var.get().strip() else "remote-new"
+
+    def _destroy(self, event: tk.Event) -> None:
+        if event.widget == self and self._timer is not None:
+            self.after_cancel(self._timer)
+            self._timer = None
+
+
 class DesktopApp(ttk.Frame):
     def __init__(self, master: tk.Tk) -> None:
         super().__init__(master)
@@ -954,17 +1039,31 @@ class DesktopApp(ttk.Frame):
             ConverterApp(ipc).grid(row=0, column=0, sticky="nsew")
         else:
             ttk.Label(ipc, text="IPC-2581 변환은 현재 비활성화되어 있습니다.").grid(padx=24, pady=24)
-        skill = SkillPane(notebook)
-        remote = RemoteClientPane(notebook)
+        skill = self.skill = SkillPane(notebook)
+        remote = self.remote = RemoteWorkPane(notebook, skill)
         notebook.add(ipc, text="IPC-2581 변환" if IPC_CONVERSION_ENABLED else "IPC-2581 변환 (비활성)",
                      state="normal" if IPC_CONVERSION_ENABLED else "disabled")
         notebook.add(skill, text="Native SKILL 생성")
         notebook.add(remote, text="원격 Allegro 작업")
-        notebook.select(skill)
+        notebook.select(remote)
+        remote.bind("<<RemoteRoleChanged>>", self._role_changed)
+        self._role_changed()
         self._menu, self._help_menu = install_help_menu(
-            master, lambda: ("remote-pid" if remote.pid_var.get().strip() else "remote-new")
+            master, lambda: remote.help_topic()
             if notebook.select() == str(remote) else "native-skill"
         )
+        master.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _role_changed(self, _event: Any = None) -> None:
+        self.notebook.tab(self.skill, state="disabled" if self.remote.role == "workstation" else "normal")
+
+    def _on_close(self) -> None:
+        if self.remote.agent is not None and not self.remote.agent.can_switch_role:
+            self.remote.agent._on_close()
+        elif self.remote._busy_reason():
+            messagebox.showinfo(APP_NAME, "진행 중인 작업을 완료하거나 취소한 뒤 프로그램을 닫으세요.", parent=self)
+        else:
+            self.master.destroy()
 
 
 def main() -> None:

@@ -47,14 +47,14 @@ def test_actual_entrypoint_initializes_font_and_window(tmp_path, monkeypatch, mo
             # short-lived interpreter, so they cannot fire during the next Tk
             # test after their Python command has been removed.
             try:
-                for callback in root.tk.call("after", "info"):
-                    root.after_cancel(callback)
                 # Release panes and their Tk variables while the interpreter is
                 # still valid.  ``root.destroy`` alone leaves Python references
                 # until GC, whose later Variable finalizers would touch a dead
                 # interpreter.
                 for child in root.winfo_children():
                     child.destroy()
+                for callback in root.tk.call("after", "info"):
+                    root.after_cancel(callback)
                 gc.collect()
                 root.destroy()
             except tk.TclError:
@@ -81,10 +81,10 @@ def ui(tmp_path, monkeypatch):
     root.withdraw()
     yield root, notices
     try:
-        for callback in root.tk.call("after", "info"):
-            root.after_cancel(callback)
         for child in root.winfo_children():
             child.destroy()
+        for callback in root.tk.call("after", "info"):
+            root.after_cancel(callback)
         gc.collect()
         root.destroy()
     except tk.TclError:
@@ -483,6 +483,186 @@ def test_help_menu_f1_binding_and_disabled_ipc_tab_smoke(ui, monkeypatch):
     assert app._help_menu.entrycget(0, "label") == "사용 안내"
     app._help_menu.invoke(0)
     assert opened == ["overview"]
+
+
+def test_remote_roles_show_only_matching_controls_and_restore_choice(ui):
+    from brd_spd.gui import load_settings
+
+    root, _notices = ui
+    app = DesktopApp(root)
+    remote = app.remote
+    assert app.notebook.select() == str(remote)
+    assert remote.role == "laptop"
+    assert remote.agent is None  # Selecting/opening the tab must never start a server.
+    assert remote.client.winfo_manager() == "grid"
+    remote.client.host_var.set("192.0.2.16")
+    remote.client.pid_var.set("123")
+    assert remote.help_topic() == "remote-pid"
+    menu = root.cget("menu")
+    close_handler = root.protocol("WM_DELETE_WINDOW")
+
+    remote.role_buttons[1].invoke()
+    assert remote.role == "workstation"
+    assert remote.client.winfo_manager() == ""
+    assert remote.agent.winfo_manager() == "grid"
+    assert remote.agent._agent is None
+    assert remote.help_topic() == "workstation"
+    assert app.notebook.tab(app.skill, "state") == "disabled"
+    assert root.cget("menu") == menu
+    assert root.protocol("WM_DELETE_WINDOW") == close_handler
+    assert root.title() == "BRD-SPD-IPC2581"
+    assert load_settings()["remote_role"] == "workstation"
+
+    remote.role_buttons[0].invoke()
+    assert remote.agent.winfo_manager() == ""
+    assert remote.client.host_var.get() == "192.0.2.16"
+    assert remote.client.pid_var.get() == "123"
+    assert app.notebook.tab(app.skill, "state") == "normal"
+    assert remote.client.run_button.instate(["disabled"])
+    remote.role_buttons[1].invoke()
+    app.destroy()
+    restored = DesktopApp(root)
+    assert restored.remote.role == "workstation"
+    assert restored.remote.agent._agent is None
+    assert restored.notebook.tab(restored.skill, "state") == "disabled"
+
+
+@pytest.mark.parametrize("busy_state", ["remote", "native", "loading", "picker"])
+def test_remote_role_cannot_hide_active_work(ui, busy_state):
+    root, _notices = ui
+    app = DesktopApp(root)
+    remote = app.remote
+    if busy_state == "remote":
+        remote.client._running = True
+    elif busy_state == "native":
+        app.skill._running = True
+    elif busy_state == "loading":
+        remote.client.spd_loading.loading = True
+    else:
+        remote.client._picker_active = True
+    remote.role_buttons[1].invoke()  # Guard also works before the periodic UI refresh.
+    assert remote.role == remote.role_var.get() == "laptop"
+    assert remote.agent is None
+    pump(root, lambda: remote.role_buttons[1].instate(["disabled"]))
+    remote.client._running = app.skill._running = False
+    remote.client.spd_loading.loading = False
+    remote.client._picker_active = False
+    pump(root, lambda: remote.role_buttons[1].instate(["!disabled"]))
+    remote.role_buttons[1].invoke()
+    assert remote.role == "workstation"
+
+
+def test_embedded_workstation_agent_start_health_stop_and_role_unlock(ui, tmp_path):
+    import sys
+    from brd_spd.remote import RemoteClient
+
+    root, notices = ui
+    app = DesktopApp(root)
+    remote = app.remote
+    remote.role_buttons[1].invoke()
+    agent = remote.agent
+    agent.host_var.set("127.0.0.1")
+    agent.port_var.set("0")
+    agent.exe_var.set(sys.executable)  # Health only; no job or process execution.
+    agent.workdir_var.set(str(tmp_path / "embedded-agent"))
+    try:
+        agent.start_button.invoke()
+        assert not agent.can_switch_role
+        remote.role_buttons[0].invoke()
+        assert remote.role == "workstation"
+        pump(root, lambda: agent._agent is not None and not agent._busy)
+        server = agent._agent
+        client = RemoteClient("127.0.0.1", port=server._server.server_address[1],
+                              token=agent.token_var.get(), fingerprint=agent.fingerprint_var.get())
+        assert client.health()["status"] == "ok"
+        assert not agent.can_switch_role
+        agent.stop_button.invoke()
+        assert not agent.can_switch_role
+        pump(root, lambda: agent.can_switch_role)
+        assert not agent.token_var.get()
+        assert not agent.fingerprint_var.get()
+        pump(root, lambda: remote.role_buttons[0].instate(["!disabled"]))
+        remote.role_buttons[0].invoke()
+        assert remote.role == "laptop"
+        assert not [item for item in notices if item[0] == "error"], notices
+    finally:
+        if agent._agent is not None:
+            agent._agent.stop()
+
+
+def test_close_during_agent_start_waits_for_stop_and_allows_stop_retry(ui, tmp_path, monkeypatch):
+    import sys
+
+    root, notices = ui
+    release_start = threading.Event()
+    stop_calls = []
+    destroyed = []
+
+    class SlowAgent:
+        def __init__(self, _config):
+            pass
+
+        def start(self):
+            assert release_start.wait(5)
+            return {"host": "127.0.0.1", "port": 0, "token": "test", "fingerprint": "test"}
+
+        def stop(self):
+            stop_calls.append(True)
+            if len(stop_calls) == 1:
+                raise RuntimeError("cancellation pending")
+
+    monkeypatch.setattr("brd_spd.remote.WorkstationAgent", SlowAgent)
+    app = DesktopApp(root)
+    app.remote.role_buttons[1].invoke()
+    agent = app.remote.agent
+    agent.exe_var.set(sys.executable)
+    agent.workdir_var.set(str(tmp_path / "agent"))
+    with monkeypatch.context() as close_patch:
+        close_patch.setattr(root, "destroy", lambda: destroyed.append(True))
+        try:
+            agent.start_button.invoke()
+            assert all(widget.instate(["disabled"]) for widget in agent._config_controls)
+            app._on_close()
+            assert agent._closing
+            assert not destroyed
+            release_start.set()
+            pump(root, lambda: bool(stop_calls) and not agent._busy)
+            assert agent._agent is not None
+            assert not destroyed
+            assert agent.stop_button.instate(["!disabled"])
+            assert agent.start_button.instate(["disabled"])
+            assert not agent.can_switch_role
+            agent.stop_button.invoke()
+            pump(root, lambda: bool(destroyed))
+            assert len(stop_calls) == 2
+            assert agent._agent is None
+            assert not agent.token_var.get()
+            assert notices and notices[-1][0] == "error"
+        finally:
+            release_start.set()
+
+
+def test_agent_start_failure_keeps_configuration_editable_and_role_switchable(ui, tmp_path, monkeypatch):
+    import sys
+
+    root, notices = ui
+    class BrokenAgent:
+        def __init__(self, _config):
+            raise OSError("port unavailable")
+    monkeypatch.setattr("brd_spd.remote.WorkstationAgent", BrokenAgent)
+    app = DesktopApp(root)
+    app.remote.role_buttons[1].invoke()
+    agent = app.remote.agent
+    agent.exe_var.set(sys.executable)
+    agent.workdir_var.set(str(tmp_path / "agent"))
+    agent.start_button.invoke()
+    pump(root, lambda: agent.can_switch_role)
+    assert all(widget.instate(["!disabled"]) for widget in agent._config_controls)
+    assert agent.start_button.instate(["!disabled"])
+    assert notices and notices[-1][0] == "error"
+    pump(root, lambda: app.remote.role_buttons[0].instate(["!disabled"]))
+    app.remote.role_buttons[0].invoke()
+    assert app.remote.role == "laptop"
 
 
 @pytest.mark.parametrize(
