@@ -5,14 +5,14 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, IPC_CONVERSION_ENABLED
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="PowerSI conversion, native Allegro scripts, and workstation jobs")
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
-    convert = commands.add_parser("convert", help="Convert SPD into IPC-2581B XML")
+    convert = commands.add_parser("convert", help="[Disabled] Convert SPD into IPC-2581B XML")
     convert.add_argument("source", type=Path)
     convert.add_argument("-o", "--output", type=Path, required=True)
     convert.add_argument("--template", type=Path, help="Original IPC-2581 XML supplies profile and library metadata")
@@ -23,7 +23,7 @@ def main(argv=None):
     validate = commands.add_parser("validate", help="Validate XML against a local official XSD")
     validate.add_argument("source", type=Path)
     validate.add_argument("--xsd", type=Path, required=True)
-    native = commands.add_parser("import-brd", help="Run installed Cadence geometry/stackup importer; not full native reconstruction")
+    native = commands.add_parser("import-brd", help="[Disabled] Import IPC geometry/stackup into a BRD copy")
     native.add_argument("source", type=Path)
     native.add_argument("-o", "--output", type=Path, required=True)
     native.add_argument("--base-brd", type=Path, required=True)
@@ -69,6 +69,8 @@ def main(argv=None):
             command.add_argument("-o", "--output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
+        if not IPC_CONVERSION_ENABLED and args.command in {"convert", "import-brd"}:
+            raise ValueError("IPC-2581 conversion is currently disabled. Use 'skill' or 'remote' for native Allegro work.")
         if args.command == "convert":
             from .convert import convert as run
             result = run(args.source, args.output, template=args.template,

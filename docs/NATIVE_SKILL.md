@@ -1,5 +1,7 @@
 # Allegro 24.1 native update bundle
 
+For the desktop workflow, open **Help / 도움말** or press **F1** to read the [offline HTML guide](help/index.html#native-skill). Load the SPD first; target lists, component options and generation remain disabled until loading succeeds. Browsing loads automatically, while a typed or restored path requires **SPD 불러오기**. Layer and net dialogs support select all, clear and Ctrl/Shift multi-selection.
+
 `brd_spd.skill.generate_bundle()` creates a batch SKILL bundle that applies selected SPD plane geometry to a caller-supplied Allegro board. Bundle generation parses the SPD but does not launch Allegro, consume a license, or prove that the native update succeeded.
 
 ```python

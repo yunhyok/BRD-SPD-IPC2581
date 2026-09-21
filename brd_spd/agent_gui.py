@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .gui import APP_NAME, load_settings, save_settings
+from .help_ui import install_help_menu
 
 
 DEFAULT_ALLEGRO = r"C:\Cadence\SPB_24.1\tools\bin\allegro.exe"
@@ -36,6 +37,7 @@ class AgentConsoleApp(ttk.Frame):
         self._busy = False
         self._closing = False
         self._build()
+        self._menu, self._help_menu = install_help_menu(master, lambda: "workstation")
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_events)
 

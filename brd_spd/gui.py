@@ -1,22 +1,93 @@
-"""Tkinter front end for converting SPD files to IPC-2581 XML."""
+"""Tkinter front end for native SKILL generation and remote Allegro jobs."""
 
 from __future__ import annotations
 
 import json
+import csv
+import io
 import os
 import queue
 import subprocess
 import sys
 import threading
 import traceback
+from concurrent.futures import CancelledError
 from pathlib import Path
 from typing import Any
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from . import IPC_CONVERSION_ENABLED
+from .help_ui import install_help_menu
+from .spd_loading import SpdLoading
+from .source_snapshot import source_snapshot
+
 
 APP_NAME = "BRD-SPD-IPC2581"
+
+
+def parse_target_values(value: str) -> list[str] | None:
+    if not value.strip():
+        return None
+    try:
+        items = [item.strip() for item in next(csv.reader([value], skipinitialspace=True, strict=True)) if item.strip()]
+    except csv.Error as exc:
+        raise ValueError("대상 이름을 확인하세요. 쉼표가 포함된 이름은 따옴표로 묶거나 목록에서 선택하세요.") from exc
+    if not items:
+        raise ValueError("대상 이름을 선택하세요. 빈칸은 전체 대상을 의미합니다.")
+    return items
+
+
+def _target_row(parent, row, label, variable, command):
+    ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
+    entry = ttk.Entry(parent, textvariable=variable)
+    entry.grid(row=row, column=1, sticky="ew", padx=10, pady=3)
+    button = ttk.Button(parent, text="목록에서 선택…", command=command)
+    button.grid(row=row, column=2, sticky="e")
+    return [entry, button]
+
+
+def _choose_targets(pane, source_var, kind):
+    if getattr(pane, "_picker_active", False):
+        return
+    if pane._running or not pane.spd_loading.require_ready():
+        return
+    from .selection_ui import open_target_picker
+    try:
+        source = Path(source_var.get().strip()).resolve()
+        if not source.is_file():
+            raise ValueError("먼저 SPD 입력 파일을 선택하세요.")
+        variable = pane.layers_var if kind == "layers" else pane.nets_var
+        selected = parse_target_values(variable.get())
+        layers = parse_target_values(pane.layers_var.get()) if kind == "nets" else None
+    except (OSError, ValueError) as exc:
+        messagebox.showerror(APP_NAME, str(exc), parent=pane)
+        return
+
+    def apply_values(values):
+        if pane._running or Path(source_var.get().strip()).resolve() != source or not pane.spd_loading.require_ready():
+            messagebox.showerror(APP_NAME, "작업 상태 또는 SPD 파일이 바뀌었습니다. 목록을 다시 열어 주세요.", parent=pane)
+            return
+        encoded = io.StringIO()
+        csv.writer(encoded, lineterminator="").writerow(values)
+        variable.set(encoded.getvalue())
+        if kind == "layers" and pane.nets_var.get().strip():
+            pane._write_log("레이어 선택이 변경되었습니다. 대상 NET 목록도 확인해 주세요.")
+
+    picker = open_target_picker(pane, source, kind, selected, layers, apply_values)
+    pane._picker_active = True
+    pane.spd_loading.sync()
+    picker.grab_set()
+
+    def closed(event):
+        if event.widget == picker:
+            pane._picker_active = False
+            try:
+                pane.spd_loading.sync()
+            except tk.TclError:
+                pass  # Parent teardown may have already destroyed its controls.
+    picker.bind("<Destroy>", closed, add="+")
 
 
 class _UserCancelled(RuntimeError):
@@ -167,6 +238,9 @@ class ConverterApp(ttk.Frame):
             self.output_var.set(path)
 
     def _start_conversion(self) -> None:
+        if not IPC_CONVERSION_ENABLED:
+            messagebox.showinfo(APP_NAME, "IPC-2581 변환은 현재 비활성화되어 있습니다.")
+            return
         if self._running:
             return
         source_text, output_text, template_text = (self.source_var.get().strip(), self.output_var.get().strip(), self.template_var.get().strip())
@@ -338,19 +412,21 @@ class RemoteClientPane(ttk.Frame):
         self.pid_check_button.grid(row=6, column=2, sticky="e")
         self.pid_note_var = tk.StringVar(value="빈칸이면 업로드한 원본 BRD로 새 Allegro 작업을 실행합니다.")
         ttk.Label(self, textvariable=self.pid_note_var, foreground="#8a4b00", wraplength=700).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 4))
-        self._file_row(8, "SPD 입력", self.spd_var, self._choose_spd, "SPD 파일", "*.spd")
+        self.spd_loading = SpdLoading(self, self.spd_var, 8, self._choose_spd)
         self._file_row(9, "원본 BRD", self.brd_var, self._choose_brd, "BRD 파일", "*.brd")
         self._file_row(10, "출력 ZIP", self.output_var, self._choose_output, "ZIP 파일", "*.zip")
         self._row(11, "기존 작업 ID", self.job_var)
-        self._row(12, "대상 레이어 (쉼표, 선택)", self.layers_var)
-        self._row(13, "대상 Net (쉼표, 선택)", self.nets_var)
-        ttk.Checkbutton(self, text="부품 위치/회전 업데이트 포함", variable=self.components_var).grid(row=14, column=1, sticky="w", pady=3)
+        targets = _target_row(self, 12, "대상 레이어 (빈칸: 전체)", self.layers_var, lambda: _choose_targets(self, self.spd_var, "layers"))
+        targets += _target_row(self, 13, "대상 NET (빈칸: 전체)", self.nets_var, lambda: _choose_targets(self, self.spd_var, "nets"))
+        self.components_check = ttk.Checkbutton(self, text="부품 위치/회전 업데이트 포함", variable=self.components_var)
+        self.components_check.grid(row=14, column=1, sticky="w", pady=3)
         controls = ttk.Frame(self)
         controls.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(10, 6))
         self.connect_button = ttk.Button(controls, text="연결 확인", command=self._connect)
         self.connect_button.grid(row=0, column=0, padx=(0, 6))
         self.run_button = ttk.Button(controls, text="전송 및 실행", command=self._run)
         self.run_button.grid(row=0, column=1, padx=(0, 6))
+        self.spd_loading.bind_controls(targets + [self.components_check, self.run_button])
         self.resume_button = ttk.Button(controls, text="기존 작업 받기", command=self._resume)
         self.resume_button.grid(row=0, column=2, padx=(0, 6))
         self.cancel_button = ttk.Button(controls, text="취소", command=self._cancel, state="disabled")
@@ -382,6 +458,7 @@ class RemoteClientPane(ttk.Frame):
         path = filedialog.askopenfilename(title="SPD 파일 선택", filetypes=[("SPD 파일", "*.spd"), ("모든 파일", "*.*")])
         if path:
             self.spd_var.set(path)
+            self.spd_loading.load()
 
     def _choose_brd(self) -> None:
         path = filedialog.askopenfilename(title="원본 BRD 선택", filetypes=[("Allegro BRD", "*.brd"), ("모든 파일", "*.*")])
@@ -451,7 +528,7 @@ class RemoteClientPane(ttk.Frame):
         self._events.put(("connected", (client, health)))
 
     def _run(self) -> None:
-        if self._running:
+        if self._running or getattr(self, "_picker_active", False) or not self.spd_loading.require_ready():
             return
         try:
             host, port, token, fingerprint = self._config()
@@ -465,7 +542,7 @@ class RemoteClientPane(ttk.Frame):
             messagebox.showerror(APP_NAME, str(exc))
             return
         source = Path(source_text)
-        base_brd = Path(brd_text) if brd_text else None
+        base_brd = Path(brd_text) if brd_text and pid is None else None
         if not source.is_file() or (pid is None and (base_brd is None or not base_brd.is_file())):
             messagebox.showerror(APP_NAME, "SPD는 항상 필요하며, PID를 비우면 원본 BRD도 필요합니다.")
             return
@@ -482,7 +559,11 @@ class RemoteClientPane(ttk.Frame):
             messagebox.showerror(APP_NAME, f"출력 폴더를 만들 수 없습니다.\n{exc}")
             return
         self._cancel_requested = False
-        options = {"layers": self._items(self.layers_var.get()), "nets": self._items(self.nets_var.get()), "update_components": self.components_var.get()}
+        try:
+            options = {"layers": self._items(self.layers_var.get()), "nets": self._items(self.nets_var.get()), "update_components": self.components_var.get()}
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
         if pid is not None:
             options["allegro_pid"] = pid
             key = pid_identity_key(host, port, fingerprint, pid)
@@ -490,12 +571,11 @@ class RemoteClientPane(ttk.Frame):
             if prior is not None and prior[0] == key:
                 options["allegro_creation_time"] = prior[1]
         options = {key: value for key, value in options.items() if value is not None}
-        self._start_worker(self._run_worker, host, port, token, fingerprint, source, base_brd, output, options)
+        self._start_worker(self._run_worker, host, port, token, fingerprint, source, base_brd, output, options, self.spd_loading.signature)
 
     @staticmethod
     def _items(value: str) -> list[str] | None:
-        items = [item.strip() for item in value.split(",") if item.strip()]
-        return items or None
+        return parse_target_values(value)
 
     def _resume(self) -> None:
         if self._running:
@@ -524,7 +604,7 @@ class RemoteClientPane(ttk.Frame):
         self._events.put(("log", f"기존 작업 연결: {job_id}"))
         self._watch_job(client, job_id, output)
 
-    def _run_worker(self, host: str, port: int, token: str, fingerprint: str, source: Path, base_brd: Path | None, output: Path, options: dict[str, Any]) -> None:
+    def _run_worker(self, host: str, port: int, token: str, fingerprint: str, source: Path, base_brd: Path | None, output: Path, options: dict[str, Any], source_signature) -> None:
         from brd_spd.remote import RemoteClient
 
         client = RemoteClient(host, port=port, token=token, fingerprint=fingerprint, timeout=30)
@@ -552,13 +632,15 @@ class RemoteClientPane(ttk.Frame):
 
             if self._cancel_requested:
                 raise _UserCancelled("사용자가 작업을 취소했습니다.")
-            client.upload_file(job_id, "spd", source, progress=upload_progress)
+            self._events.put(("log", "로딩한 SPD의 작업용 사본 준비"))
+            with source_snapshot(source, source_signature, output.parent, lambda: self._cancel_requested) as snapshot:
+                client.upload_file(job_id, "spd", snapshot, progress=upload_progress)
             if base_brd is not None:
                 client.upload_file(job_id, "brd", base_brd, progress=upload_progress)
             if self._cancel_requested:
                 raise _UserCancelled("사용자가 작업을 취소했습니다.")
             client.submit_job(job_id)
-        except _UserCancelled:
+        except (_UserCancelled, CancelledError):
             client.cancel_job(job_id)
             self._events.put(("log", "취소 요청을 Agent에 전송했습니다."))
         except Exception:
@@ -613,6 +695,7 @@ class RemoteClientPane(ttk.Frame):
 
     def _start_worker(self, target: Any, *args: Any) -> None:
         self._running = True
+        self.spd_loading.sync()
         self.connect_button.configure(state="disabled")
         self.run_button.configure(state="disabled")
         self.resume_button.configure(state="disabled")
@@ -671,7 +754,7 @@ class RemoteClientPane(ttk.Frame):
     def _finish(self, status: str) -> None:
         self._running = False
         self.connect_button.configure(state="normal")
-        self.run_button.configure(state="normal")
+        self.spd_loading.sync()
         self.resume_button.configure(state="normal")
         self.pid_check_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
@@ -707,15 +790,17 @@ class SkillPane(ttk.Frame):
         self.rowconfigure(7, weight=1)
         ttk.Label(self, text="Native import SKILL 생성", font=("Malgun Gothic", 15, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Label(self, text="SKILL은 라이선스가 있는 Allegro 워크스테이션에서 검토 후 실행합니다. 원본 BRD의 규칙·배선·동적 plane 자동 복원은 범위에 포함되지 않습니다.", foreground="#8a4b00", wraplength=720).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
-        self._file_row(2, "SPD 입력", self.source_var, self._choose_source, "파일", "*.spd")
+        self.spd_loading = SpdLoading(self, self.source_var, 2, self._choose_source)
         self._folder_row(3, "새 번들 출력 폴더", self.output_var, self._choose_output)
-        self._entry_row(4, "대상 레이어 (쉼표, 선택)", self.layers_var)
-        self._entry_row(5, "대상 Net (쉼표, 선택)", self.nets_var)
-        ttk.Checkbutton(self, text="기존 부품 위치/회전 데이터 포함", variable=self.components_var).grid(row=6, column=1, sticky="w", pady=4)
+        targets = _target_row(self, 4, "대상 레이어 (빈칸: 전체)", self.layers_var, lambda: _choose_targets(self, self.source_var, "layers"))
+        targets += _target_row(self, 5, "대상 NET (빈칸: 전체)", self.nets_var, lambda: _choose_targets(self, self.source_var, "nets"))
+        self.components_check = ttk.Checkbutton(self, text="기존 부품 위치/회전 데이터 포함", variable=self.components_var)
+        self.components_check.grid(row=6, column=1, sticky="w", pady=4)
         controls = ttk.Frame(self)
         controls.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 6))
         self.generate_button = ttk.Button(controls, text="SKILL 번들 생성", command=self._generate)
         self.generate_button.grid(row=0, column=0, padx=(0, 8))
+        self.spd_loading.bind_controls(targets + [self.components_check, self.generate_button])
         self.open_button = ttk.Button(controls, text="출력 폴더 열기", command=self._open_folder, state="disabled")
         self.open_button.grid(row=0, column=1)
         ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=2, sticky="w", padx=12)
@@ -746,6 +831,7 @@ class SkillPane(ttk.Frame):
         path = filedialog.askopenfilename(title="SPD 파일 선택", filetypes=[("SPD 파일", "*.spd"), ("모든 파일", "*.*")])
         if path:
             self.source_var.set(path)
+            self.spd_loading.load()
 
     def _choose_output(self) -> None:
         path = filedialog.askdirectory(title="새 SKILL 번들을 만들 상위 폴더 선택")
@@ -761,11 +847,10 @@ class SkillPane(ttk.Frame):
 
     @staticmethod
     def _items(value: str) -> list[str] | None:
-        items = [item.strip() for item in value.split(",") if item.strip()]
-        return items or None
+        return parse_target_values(value)
 
     def _generate(self) -> None:
-        if self._running:
+        if self._running or getattr(self, "_picker_active", False) or not self.spd_loading.require_ready():
             return
         source_text, output_text = self.source_var.get().strip(), self.output_var.get().strip()
         source = Path(source_text)
@@ -776,10 +861,15 @@ class SkillPane(ttk.Frame):
         if output.exists():
             messagebox.showerror(APP_NAME, "새 번들 출력 폴더를 지정하세요. 이미 존재하는 폴더에는 생성할 수 없습니다.")
             return
-        layers, nets = self._items(self.layers_var.get()), self._items(self.nets_var.get())
+        try:
+            layers, nets = self._items(self.layers_var.get()), self._items(self.nets_var.get())
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
         update_components = self.components_var.get()
+        source_signature = self.spd_loading.signature
         self._running = True
-        self.generate_button.configure(state="disabled")
+        self.spd_loading.sync()
         self.open_button.configure(state="disabled")
         self.status_var.set("SKILL 생성 중…")
         def worker() -> None:
@@ -788,7 +878,10 @@ class SkillPane(ttk.Frame):
 
                 def progress(message: Any) -> None:
                     self._events.put(("log", str(message)))
-                report = generate_bundle(source, output, layers=layers, nets=nets, update_components=update_components, progress=progress)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                progress("로딩한 SPD의 작업용 사본 준비")
+                with source_snapshot(source, source_signature, output.parent) as snapshot:
+                    report = generate_bundle(snapshot, output, layers=layers, nets=nets, update_components=update_components, progress=progress)
                 self._events.put(("complete", (output, report)))
             except Exception as exc:
                 self._events.put(("error", (str(exc), traceback.format_exc())))
@@ -817,7 +910,7 @@ class SkillPane(ttk.Frame):
 
     def _finish(self, status: str) -> None:
         self._running = False
-        self.generate_button.configure(state="normal")
+        self.spd_loading.sync()
         self.open_button.configure(state="normal")
         self.status_var.set(status)
         save_settings({"skill_spd": self.source_var.get(), "skill_output": self.output_var.get(), "skill_layers": self.layers_var.get(), "skill_nets": self.nets_var.get()})
@@ -852,17 +945,26 @@ class DesktopApp(ttk.Frame):
         self.grid(sticky="nsew")
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        notebook = ttk.Notebook(self)
+        notebook = self.notebook = ttk.Notebook(self)
         notebook.grid(sticky="nsew")
         ipc = ttk.Frame(notebook)
         ipc.columnconfigure(0, weight=1)
         ipc.rowconfigure(0, weight=1)
-        ConverterApp(ipc).grid(row=0, column=0, sticky="nsew")
+        if IPC_CONVERSION_ENABLED:
+            ConverterApp(ipc).grid(row=0, column=0, sticky="nsew")
+        else:
+            ttk.Label(ipc, text="IPC-2581 변환은 현재 비활성화되어 있습니다.").grid(padx=24, pady=24)
         skill = SkillPane(notebook)
         remote = RemoteClientPane(notebook)
-        notebook.add(ipc, text="IPC-2581 변환")
+        notebook.add(ipc, text="IPC-2581 변환" if IPC_CONVERSION_ENABLED else "IPC-2581 변환 (비활성)",
+                     state="normal" if IPC_CONVERSION_ENABLED else "disabled")
         notebook.add(skill, text="Native SKILL 생성")
         notebook.add(remote, text="원격 Allegro 작업")
+        notebook.select(skill)
+        self._menu, self._help_menu = install_help_menu(
+            master, lambda: ("remote-pid" if remote.pid_var.get().strip() else "remote-new")
+            if notebook.select() == str(remote) else "native-skill"
+        )
 
 
 def main() -> None:
