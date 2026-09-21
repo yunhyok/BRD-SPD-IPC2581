@@ -1,0 +1,2 @@
+# Preserve the official schema bytes and documented SHA-256 on every platform.
+schemas/IPC-2581B1.xsd -text
