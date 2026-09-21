@@ -18,3 +18,9 @@ local-test/
 schemas/IPC-2581B.xsd
 .pytest_cache/
 build-final*.err
+build-*.err
+*.pem
+*.key
+pairing-token.txt
+token.txt
+agent-data/

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from lxml import etree as E
 
+from . import __version__
 from .geometry import NS, el, sub, xy, num, ring, primitive, feature_set
 from .planes import write_planes
 from .names import IPCWriter
@@ -95,7 +96,7 @@ def _header(metadata, reference, names, drill_names, scale):
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     history = el("HistoryRecord", number="1", origination=now, lastChange=now, software="BRD-SPD-IPC2581")
     revision = sub(history, "FileRevision", fileRevisionId="1", comment="Generated from SPD; see adjacent report")
-    software = sub(revision, "SoftwarePackage", name="BRD-SPD-IPC2581", vendor="BRD-SPD-IPC2581", revision="0.1.0")
+    software = sub(revision, "SoftwarePackage", name="BRD-SPD-IPC2581", vendor="BRD-SPD-IPC2581", revision=__version__)
     sub(software, "Certification", certificationStatus="SELFTEST")
     return step, content, logistics, history
 

@@ -1,0 +1,68 @@
+# 노트북에서 Allegro 워크스테이션 제어
+
+## 준비
+
+두 PC에 같은 버전의 Windows 설치파일을 설치합니다. Allegro와 라이선스는 워크스테이션에만 필요합니다. 기본 Allegro 실행 파일은 `C:\Cadence\SPB_24.1\tools\bin\allegro.exe`이며 화면에서 변경할 수 있습니다.
+
+이 프로그램의 기본 작업은 **동일 보드의 원본 BRD에 SPD의 plane 형상을 반영하여 새 BRD를 만드는 것**입니다. 일반적인 SPD만으로 원본의 모든 native 설계 객체와 규칙을 복구하는 기능은 아닙니다. 지원 범위는 [NATIVE_SKILL.md](NATIVE_SKILL.md)를 확인하세요.
+
+## 워크스테이션에서 한 번 설정
+
+1. 시작 메뉴에서 **BRD-SPD Workstation Agent**를 실행합니다.
+2. Allegro 실행 파일, 작업 폴더, 수신 IP와 포트를 지정합니다. 모든 로컬 네트워크 인터페이스를 사용하려면 수신 IP를 `0.0.0.0`으로 두고 기본 포트 `8765`를 사용합니다.
+3. 필요하면 허용할 노트북 IP를 입력합니다. 서버를 시작한 다음 화면의 접속 토큰과 인증서 SHA-256 지문을 노트북 프로그램에 옮깁니다.
+
+토큰과 인증서는 해당 작업 폴더에 유지됩니다. 작업 폴더를 바꾸면 별도 서버 설정으로 취급됩니다. 토큰은 이 에이전트의 작업을 실행·취소·조회할 수 있는 접속 자격입니다. 프로그램은 방화벽 규칙이나 Windows 자동 시작 설정을 임의로 변경하지 않습니다. 기존 인트라넷 통신이 가능하더라도 새 포트가 차단되어 있으면 해당 PC의 관리 정책에 맞게 허용해야 합니다.
+
+## 노트북에서 작업 실행
+
+1. 메인 프로그램의 원격 작업 화면에서 현재 워크스테이션 IP/호스트명과 포트를 입력합니다. 에이전트가 표시한 접속 토큰과 인증서 지문을 입력하고 연결을 확인합니다.
+2. 수정한 SPD와 같은 보드의 원본 BRD를 선택합니다. 레이어와 net을 지정하면 해당 범위의 plane만 반영합니다. 지정하지 않으면 지원되는 SPD plane 전체가 대상입니다.
+3. 파일 전송과 실행을 시작합니다. 화면의 작업 ID를 보관하면 프로그램을 다시 열어도 서버에 남아 있는 작업 상태와 로그를 조회할 수 있습니다.
+4. 완료 후 새 경로에 결과 ZIP을 다운로드합니다. `result.brd`와 생성·실행 로그, 구조화된 보고서를 함께 확인합니다. 실패한 작업에서도 로그 묶음을 회수할 수 있습니다.
+
+작업 취소는 해당 작업에만 적용됩니다. 다른 Allegro 세션을 종료하지 않습니다. 파일 전송 중의 실패나 네트워크 끊김이 서버의 작업 성공을 뜻하지는 않습니다. 다시 접속한 뒤 작업 ID로 상태를 확인하세요. 파일 업로드의 중간 바이트 재개는 지원하지 않습니다.
+
+## IP가 변경되었을 때
+
+노트북에서 워크스테이션 주소를 새 IP로 바꾸면 됩니다. 같은 에이전트 작업 폴더를 사용하면 토큰과 인증서 지문은 유지됩니다. 워크스테이션에서 노트북 IP 허용 목록을 설정했다면 노트북 IP 변경도 목록에 반영해야 합니다. 고정된 특정 인터페이스 IP에 서버를 바인딩했다면 새 주소로 수정하고 서버를 재시작하세요. `0.0.0.0` 수신 설정은 특정 주소에 종속되지 않습니다.
+
+## 출력과 상태 해석
+
+| 산출물 | 용도 |
+|---|---|
+| `design.il`, `run.scr` | Allegro에서 실행하는 생성 스크립트 |
+| `manifest.json` | 생성 옵션과 스크립트 묶음 정보 |
+| `generation.log`, `generation.report.json` | 지원하지 않는 항목, 누락 및 생성 형상 통계 |
+| `execution.log`, `runner.log` | SKILL 실행 및 Allegro 프로세스 진단 |
+| `result.json` | SKILL의 저장 성공 여부 |
+| `result.brd` | 성공한 작업이 별도로 저장한 결과 보드 |
+
+에이전트는 프로세스 종료 코드, SKILL 결과 표식, 결과 BRD의 존재를 함께 확인합니다. 실행 성공은 전기적 타당성이나 DRC 통과를 보증하지 않습니다. 결과 보드를 Allegro에서 열어 변경한 영역, net, void 및 DRC를 확인해야 합니다. 원본과의 전체 동등성은 별도 검증 대상입니다.
+
+## CLI 예시
+
+워크스테이션:
+
+```powershell
+brd-spd-ipc2581-cli.exe serve --host 0.0.0.0 --port 8765 --allegro-exe "C:\Cadence\SPB_24.1\tools\bin\allegro.exe"
+```
+
+노트북의 PowerShell:
+
+```powershell
+$WorkstationAddress = "현재_워크스테이션_IP"
+$CertificateFingerprint = "에이전트에_표시된_SHA256_지문"
+brd-spd-ipc2581-cli.exe remote --host $WorkstationAddress --token-file pairing-token.txt --fingerprint $CertificateFingerprint health
+brd-spd-ipc2581-cli.exe remote --host $WorkstationAddress --token-file pairing-token.txt --fingerprint $CertificateFingerprint submit edited.spd --base-brd original.brd
+brd-spd-ipc2581-cli.exe remote --host $WorkstationAddress --token-file pairing-token.txt --fingerprint $CertificateFingerprint status JOB_ID
+brd-spd-ipc2581-cli.exe remote --host $WorkstationAddress --token-file pairing-token.txt --fingerprint $CertificateFingerprint logs JOB_ID
+brd-spd-ipc2581-cli.exe remote --host $WorkstationAddress --token-file pairing-token.txt --fingerprint $CertificateFingerprint cancel JOB_ID
+brd-spd-ipc2581-cli.exe remote --host $WorkstationAddress --token-file pairing-token.txt --fingerprint $CertificateFingerprint download JOB_ID -o result.zip
+```
+
+토큰 파일에는 토큰 한 줄만 넣습니다. 공용 저장소나 보고서에 접속 토큰을 포함하지 마세요. 로컬 SKILL 생성과 IPC 변환에는 원격 접속 정보가 필요하지 않습니다.
+
+## 검증 경계
+
+자동 테스트는 인증된 HTTPS 전송, 잘못된 토큰·인증서 차단, 작업 상태 전이, 취소와 결과 회수를 합성 데이터로 검증합니다. 실제 Allegro 24.1의 라이선스, SKILL 실행 호환성, 실제 보드의 DRC는 워크스테이션에서 실행해야 검증할 수 있습니다. 이 둘의 결과를 혼동하지 않도록 보고서에 구분해 남깁니다.

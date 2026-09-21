@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.0",
+    [string]$Version = "0.2.0",
     [switch]$SkipInstaller
 )
 
@@ -28,6 +28,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "GUI PyInstaller build failed with exit code $LASTEXITCODE." }
     python -m PyInstaller --noconfirm --clean --console --onefile --collect-submodules brd_spd --add-data $SchemaData --name "brd-spd-ipc2581-cli" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_cli.py
     if ($LASTEXITCODE -ne 0) { throw "CLI PyInstaller build failed with exit code $LASTEXITCODE." }
+    python -m PyInstaller --noconfirm --clean --windowed --onefile --collect-submodules brd_spd --add-data $SchemaData --name "BRD-SPD-IPC2581-Agent" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_agent.py
+    if ($LASTEXITCODE -ne 0) { throw "Workstation Agent PyInstaller build failed with exit code $LASTEXITCODE." }
 
     if (-not $SkipInstaller) {
         if (-not $InnoSetup) {

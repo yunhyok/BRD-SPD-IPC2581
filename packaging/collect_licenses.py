@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 
-RUNTIME_DISTRIBUTIONS = ("lxml", "shapely", "numpy", "pyinstaller")
+RUNTIME_DISTRIBUTIONS = ("lxml", "shapely", "numpy", "cryptography", "cffi", "pycparser", "pyinstaller")
 SOURCE_URLS = {
     "libxml2": "https://download.gnome.org/sources/libxml2/",
     "libxslt": "https://download.gnome.org/sources/libxslt/",

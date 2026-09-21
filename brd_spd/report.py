@@ -3,6 +3,7 @@ import json
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from . import __version__
 
 
 class Report:
@@ -10,7 +11,7 @@ class Report:
         self.output = Path(output)
         self.counts = Counter()
         self.warnings = {}
-        self.data = {"tool": "BRD-SPD-IPC2581", "version": "0.1.0",
+        self.data = {"tool": "BRD-SPD-IPC2581", "version": __version__,
                      "started_utc": datetime.now(timezone.utc).isoformat(),
                      "status": "running", "allegro_import_verified": False}
 

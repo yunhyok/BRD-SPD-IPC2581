@@ -1,6 +1,6 @@
-; Build with: ISCC /DMyAppVersion=0.1.0 packaging\BRD-SPD-IPC2581.iss
+; Build with: ISCC /DMyAppVersion=0.2.0 packaging\BRD-SPD-IPC2581.iss
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.2.0"
 #endif
 
 #define MyAppName "BRD-SPD-IPC2581"
@@ -35,6 +35,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\dist\BRD-SPD-IPC2581.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\brd-spd-ipc2581-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\BRD-SPD-IPC2581-Agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -43,6 +44,7 @@ Source: "..\build\third-party-licenses\*"; DestDir: "{app}\third-party-licenses"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autoprograms}\{#MyAppName} Workstation Agent"; Filename: "{app}\BRD-SPD-IPC2581-Agent.exe"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
