@@ -57,3 +57,5 @@ ipc2581_in <xml> -x -g -i <original.brd> -o <new.brd>
 4. XSD 유효성은 문법·타입·일부 참조를 검사합니다. 전기적 연결성, 제조 가능성, Cadence import의 native 의미까지 증명하지 않습니다. [IPC Consortium 설명](https://www.ipc2581.com/ipc-2581-file-validation-tool/)도 이 경계를 명시합니다.
 
 런타임 산출물은 인접 로그를 검토하고, plane 면적/void, 패드, 부품 방향, net 연결을 원본 CAD와 비교한 후 사용하세요.
+
+2026-09-21 로컬 검증에서 합성 SPD → XSD-valid XML → 설치된 Allegro `ipc2581_in` 24.1S008 → 새 BRD의 실행을 확인했습니다(종료 코드 0). 이는 importer가 파일을 수용하고 BRD를 생성했다는 검증이며, native ETCH/부품의 의미 보존 검증은 아닙니다.

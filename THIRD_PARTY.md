@@ -3,6 +3,7 @@
 The MIT license of this project covers its original source code, not third-party standards or libraries.
 
 - `schemas/IPC-2581B1.xsd`: official IPC-2581 Revision B Amendment 1 schema, downloaded unchanged from https://webstds.ipc.org/2581/IPC-2581B1.xsd. IPC is the source/rights holder. This project does not claim ownership of the schema or IPC certification.
+  Retrieved 2026-09-21. SHA-256: `e0ccbf14e8e6c938a0236f382feb66e8944d2975f9e2d90aaa11a743b9543342`. The upstream download endpoint may reject automated requests; the pinned local copy supports offline validation.
 - Python: Python Software Foundation license.
 - lxml: BSD-3-Clause; libxml2/libxslt retain their respective MIT-style licenses.
 - Shapely: BSD-3-Clause; the included GEOS library is LGPL-2.1-or-later and remains a dynamically loaded library. See https://libgeos.org/ and https://github.com/shapely/shapely for corresponding source and license notices.

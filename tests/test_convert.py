@@ -48,6 +48,18 @@ Regular Circle 0.3mm
 
 
 class ConversionTests(unittest.TestCase):
+    def test_void_attaches_to_nearest_preceding_containing_parent(self):
+        source_text = SPD.replace(
+            "Circle2::PWR- 5mm 5mm 1mm",
+            "Polygon2::PWR+ 2mm 2mm 8mm 2mm 8mm 8mm 2mm 8mm\nCircle3::PWR- 5mm 5mm 1mm")
+        with tempfile.TemporaryDirectory() as directory:
+            source, output = Path(directory)/"shape.spd", Path(directory)/"shape.xml"
+            source.write_text(source_text)
+            convert(source, output)
+            ns = {"i": "http://webstds.ipc.org/2581"}
+            contours = E.parse(str(output)).xpath("//i:LayerFeature/i:Set/i:Features/i:Contour", namespaces=ns)
+            self.assertEqual([len(c.findall("i:Cutout", ns)) for c in contours], [0, 1])
+
     def test_actual_conversion_preserves_geometry_and_reports_losses(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
