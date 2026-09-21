@@ -15,7 +15,10 @@ import sys
 from pathlib import Path
 
 
-RUNTIME_DISTRIBUTIONS = ("lxml", "shapely", "numpy", "cryptography", "cffi", "pycparser", "pyinstaller")
+RUNTIME_DISTRIBUTIONS = (
+    "lxml", "shapely", "numpy", "cryptography", "cffi", "pycparser",
+    "pyinstaller", "tkinterweb", "tkinterweb-tkhtml",
+)
 SOURCE_URLS = {
     "libxml2": "https://download.gnome.org/sources/libxml2/",
     "libxslt": "https://download.gnome.org/sources/libxslt/",
@@ -29,6 +32,7 @@ def _is_notice(path: Path) -> bool:
         "license" in name
         or "copying" in name
         or "notice" in name
+        or "copyright" in name
         or "authors" in name
         or any(part.lower() in {"license", "licenses", "legal"} for part in path.parts)
     )

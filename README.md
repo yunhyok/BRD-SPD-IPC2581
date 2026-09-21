@@ -8,7 +8,7 @@
 
 ## 설치와 실행
 
-1. [Releases](https://github.com/yunhyok/BRD-SPD-IPC2581/releases)의 `BRD-SPD-IPC2581-Setup-0.4.0.exe`를 노트북과 워크스테이션에 설치합니다. 별도 Python 설치는 필요하지 않습니다.
+1. [Releases](https://github.com/yunhyok/BRD-SPD-IPC2581/releases)의 `BRD-SPD-IPC2581-Setup-0.4.1.exe`를 노트북과 워크스테이션에 설치합니다. 별도 Python 설치는 필요하지 않습니다.
 2. 워크스테이션에서 **Workstation Agent**를 열어 Allegro 실행 파일을 지정하고 서버를 시작합니다. 화면에 표시된 접속 토큰과 인증서 지문을 노트북에 입력합니다.
 3. 노트북의 **원격 Allegro 작업**에서 워크스테이션 IP를 입력하고 SPD를 불러옵니다. **찾아보기…**로 파일을 선택하면 자동으로 읽으며, 직접 입력하거나 저장된 경로는 **SPD 불러오기**를 누릅니다. 로딩 후 대상 레이어·NET과 부품 옵션, 실행 버튼이 활성화됩니다.
 4. **Allegro PID**를 입력하면 해당 프로세스에 현재 열린 BRD에 반영합니다. PID를 비우면 업로드한 원본 BRD로 새 Allegro를 실행합니다. 진행 로그를 확인하고 완료 후 결과 ZIP을 다운로드합니다.
@@ -17,7 +17,7 @@ PID는 워크스테이션 작업 관리자의 **세부 정보 → allegro.exe �
 
 IP는 언제든 바꿀 수 있습니다. 인증서와 토큰은 워크스테이션의 작업 폴더에 보관되므로 IP만 변경된 경우 다시 발급할 필요가 없습니다. Allegro 기본 경로는 `C:\Cadence\SPB_24.1\tools\bin\allegro.exe`입니다. 에이전트가 실행 중인 Windows 사용자에게 Allegro 라이선스와 보드 접근 권한이 있어야 합니다.
 
-**Native SKILL 생성** 탭에서는 스크립트 묶음만 생성합니다. **원격 Allegro 작업** 탭은 워크스테이션에서 스크립트 생성과 실행, 결과 회수를 수행합니다. **Help / 도움말** 메뉴 또는 **F1**으로 그림과 단계별 설명이 있는 [오프라인 HTML 도움말](docs/help/index.html)을 엽니다. Workstation Agent에도 같은 메뉴가 있습니다.
+**Native SKILL 생성** 탭에서는 스크립트 묶음만 생성합니다. **원격 Allegro 작업** 탭은 워크스테이션에서 스크립트 생성과 실행, 결과 회수를 수행합니다. **Help / 도움말** 메뉴 또는 **F1**은 그림과 단계별 설명이 있는 [오프라인 HTML 도움말](docs/help/index.html)을 프로그램 안의 내장 뷰어로 엽니다. Chrome, Edge, WebView2 또는 인터넷 설치는 필요하지 않습니다. Workstation Agent에도 같은 메뉴가 있습니다.
 
 대상 레이어·NET의 **목록에서 선택…**을 누르면 별도 선택 창이 열립니다. **전체 선택**, **선택 해제**, **Ctrl/Shift 다중 선택**을 지원하며 NET 목록은 선택한 레이어에 맞춰 표시됩니다. 빈 입력란은 전체 대상이라는 뜻이며 목록 창에서 0개 선택한 상태로 적용할 수는 없습니다. SPD 경로를 바꾸면 기존 선택을 초기화하고 다시 불러와야 합니다. 로딩 전에도 도움말, 연결·PID 확인, 기존 작업 결과 받기는 사용할 수 있습니다.
 

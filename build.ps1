@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.4.0",
+    [string]$Version = "0.4.1",
     [switch]$SkipInstaller
 )
 
@@ -25,11 +25,11 @@ Push-Location $ProjectRoot
 try {
     python packaging\collect_licenses.py --output $ThirdPartyLicenseDir
     if ($LASTEXITCODE -ne 0) { throw "Third-party license collection failed with exit code $LASTEXITCODE." }
-    python -m PyInstaller --noconfirm --clean --windowed --onefile --collect-submodules brd_spd --add-data $SchemaData --add-data $HelpData --name "BRD-SPD-IPC2581" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_gui.py
+    python -m PyInstaller --noconfirm --clean --windowed --onefile --collect-submodules brd_spd --collect-all tkinterweb --collect-all tkinterweb_tkhtml --exclude-module PIL --add-data $SchemaData --add-data $HelpData --name "BRD-SPD-IPC2581" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_gui.py
     if ($LASTEXITCODE -ne 0) { throw "GUI PyInstaller build failed with exit code $LASTEXITCODE." }
-    python -m PyInstaller --noconfirm --clean --console --onefile --collect-submodules brd_spd --add-data $SchemaData --add-data $HelpData --name "brd-spd-ipc2581-cli" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_cli.py
+    python -m PyInstaller --noconfirm --clean --console --onefile --collect-submodules brd_spd --collect-all tkinterweb --collect-all tkinterweb_tkhtml --exclude-module PIL --add-data $SchemaData --add-data $HelpData --name "brd-spd-ipc2581-cli" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_cli.py
     if ($LASTEXITCODE -ne 0) { throw "CLI PyInstaller build failed with exit code $LASTEXITCODE." }
-    python -m PyInstaller --noconfirm --clean --windowed --onefile --collect-submodules brd_spd --add-data $SchemaData --add-data $HelpData --name "BRD-SPD-IPC2581-Agent" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_agent.py
+    python -m PyInstaller --noconfirm --clean --windowed --onefile --collect-submodules brd_spd --collect-all tkinterweb --collect-all tkinterweb_tkhtml --exclude-module PIL --add-data $SchemaData --add-data $HelpData --name "BRD-SPD-IPC2581-Agent" --distpath $DistDir --workpath $BuildDir --specpath $SpecDir launch_agent.py
     if ($LASTEXITCODE -ne 0) { throw "Workstation Agent PyInstaller build failed with exit code $LASTEXITCODE." }
 
     if (-not $SkipInstaller) {

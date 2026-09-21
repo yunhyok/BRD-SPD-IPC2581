@@ -9,6 +9,10 @@ The MIT license of this project covers its original source code, not third-party
 - lxml: BSD-3-Clause; libxml2/libxslt retain their respective MIT-style licenses.
 - Shapely: BSD-3-Clause; the included GEOS library is LGPL-2.1-or-later and remains a dynamically loaded library. See https://libgeos.org/ and https://github.com/shapely/shapely for corresponding source and license notices.
 - PyInstaller: GPL with the exception allowing distribution of bundled applications under their own licenses.
+- TkinterWeb: MIT. The application uses its in-process Tk/Tkhtml HTML and CSS widget for local help pages.
+- TkinterWeb-Tkhtml: MIT; its bundled modified Tkhtml3 native libraries retain the included 3-clause BSD `tkhtml/COPYRIGHT` notice.
 - Inno Setup: its own license; used to generate the Windows installer.
+
+The pinned TkinterWeb base packages do not require WebView2, Chromium, or a remote browser. `tkinterweb-tkhtml` loads its Tkhtml native library directly into the application's Tcl/Tk process; optional TkinterWeb extras are not installed.
 
 No Cadence executable, proprietary documentation, license file, or customer board data is redistributed. The optional Cadence importer uses the user's separate installation.
