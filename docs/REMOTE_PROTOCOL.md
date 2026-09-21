@@ -9,10 +9,10 @@
 - LAN 접속에서 `RemoteClient`는 인증서 SHA-256 fingerprint를 반드시 받아야 합니다. 인증 기관 검증 대신 최초 페어링 때 전달받은 fingerprint를 고정하여 중간자 인증서를 거부합니다.
 - 모든 요청은 `Authorization: Bearer <token>`을 사용하며 Agent는 `hmac.compare_digest`로 비교합니다.
 - `allowed_clients`를 설정하면 지정 IP 또는 CIDR에서 온 연결만 허용합니다.
-- 업로드 슬롯은 `spd`, `brd`뿐입니다. 서버 파일명은 각각 `input.spd`, `base.brd`로 고정됩니다. 클라이언트 경로, 파일명, 명령, PID는 서버 실행 인자로 사용할 수 없습니다.
+- 업로드 슬롯은 `spd`, `brd`뿐입니다. 서버 파일명은 각각 `input.spd`, `base.brd`로 고정됩니다. 클라이언트 경로, 파일명, 임의 명령은 서버 실행 인자로 사용할 수 없습니다. PID 모드는 검증한 Allegro 프로세스에 서버가 생성한 SKILL의 `load` 명령만 전달합니다.
 - UUID 작업 ID를 엄격히 검사하고 URL 디코딩 후 경로를 판별하므로 `..`, 인코딩된 traversal, 임의 절대 경로를 허용하지 않습니다.
 - 업로드는 압축하지 않은 raw stream이며 기본 한도는 파일당 10 GiB입니다. `AgentConfig.max_upload_bytes`로 낮추거나 높일 수 있습니다.
-- 결과 ZIP에는 입력 SPD/BRD가 포함되지 않습니다.
+- 결과 ZIP에는 업로드한 입력 SPD/BRD가 포함되지 않습니다. PID 모드에서는 현재 설계의 변경 전 백업 `session-before.brd`가 포함됩니다.
 - 같은 데이터 디렉터리는 OS 파일 잠금으로 한 Agent 프로세스만 사용할 수 있습니다. 두 Agent를 운영할 때는 서로 다른 데이터 디렉터리를 지정해야 합니다.
 - 연결별 30초 socket timeout을 적용하고 TLS handshake를 요청 처리 스레드에서 수행하므로, handshake를 끝내지 않는 연결이 다른 클라이언트의 접속을 막지 않습니다.
 
@@ -70,17 +70,18 @@ result_path = client.download_result(job["id"], Path("native-result.zip"), print
 | 메서드 | 경로 | 동작 |
 |---|---|---|
 | `GET` | `/v1/health` | 프로토콜 버전, 단일 runner, 최대 업로드 크기 확인 |
+| `GET` | `/v1/allegro/{pid}` | 워크스테이션 Allegro PID, 실행 경로, 생성 시각 확인 |
 | `GET` | `/v1/jobs?limit=100` | 최근 작업 조회, 최대 100개 |
 | `POST` | `/v1/jobs` | `{"options": {...}}`로 작업 생성 |
 | `PUT` | `/v1/jobs/{uuid}/files/spd` | raw SPD 업로드 |
 | `PUT` | `/v1/jobs/{uuid}/files/brd` | raw 기준 BRD 업로드 |
-| `POST` | `/v1/jobs/{uuid}/submit` | 두 입력이 완전히 업로드된 작업을 단일 실행 큐에 제출 |
+| `POST` | `/v1/jobs/{uuid}/submit` | 필요한 입력 업로드 완료 후 단일 실행 큐에 제출 (PID 모드: SPD만) |
 | `GET` | `/v1/jobs/{uuid}` | 영속 작업 상태 조회 |
 | `GET` | `/v1/jobs/{uuid}/logs?offset=N` | 최대 1 MiB 로그와 다음 byte offset 조회 |
-| `POST` | `/v1/jobs/{uuid}/cancel` | 대기 작업 취소 또는 해당 작업이 소유한 프로세스 종료 |
+| `POST` | `/v1/jobs/{uuid}/cancel` | 대기 작업 취소, 새 실행의 소유 프로세스 종료, 또는 기존 세션의 협조적 취소 |
 | `GET` | `/v1/jobs/{uuid}/result` | 종료 작업의 결과/진단 ZIP 다운로드 |
 
-메타데이터 요청은 64 KiB로 제한됩니다. 지원 옵션은 `layers: list[str]`, `nets: list[str]`, `update_components: bool`뿐입니다. 알 수 없는 옵션은 거부합니다.
+메타데이터 요청은 64 KiB로 제한됩니다. 지원 옵션은 `layers: list[str]`, `nets: list[str]`, `update_components: bool`, `allegro_pid: int`, `allegro_creation_time: int`입니다. 알 수 없는 옵션은 거부합니다. PID는 1~4,294,967,295이며 생성 시각은 `check_pid`가 반환한 Windows FILETIME 값입니다. 생성 시각은 PID와 함께 지정하며 확인 후 PID가 재사용되면 거부됩니다. Agent는 작업 생성 시 실제 실행 경로와 생성 시각을 저장하고 제출·전달 시 재검사합니다. `/v1/health`의 `capabilities`에 `allegro_pid`가 있으면 이 기능을 지원합니다.
 
 상태 흐름은 다음과 같습니다.
 
@@ -91,7 +92,7 @@ created -> queued -> running -> succeeded
                     `restart-> interrupted
 ```
 
-Agent는 동시에 하나의 native 작업만 실행하여 Allegro 라이선스 슬롯 하나만 사용합니다. 실행 중 Agent가 재시작되면 남아 있던 `running` 또는 `cancel_requested` 상태를 `interrupted`로 바꿉니다. `queued` 작업은 다시 큐에 넣습니다.
+Agent는 동시에 하나의 native 작업만 실행합니다. 실행 중 Agent가 재시작되면 새 프로세스로 시작한 `running` 또는 `cancel_requested` 작업은 `interrupted`로 바꿉니다. 이미 명령을 전달한 PID 작업은 결과 표식 관찰을 재개하며 명령을 다시 보내지 않습니다. `queued` 작업은 다시 큐에 넣습니다.
 
 종료 상태는 결과 ZIP이 임시 파일에서 원자적으로 배치된 다음 공개됩니다. 따라서 `succeeded`, `failed`, `cancelled`, `interrupted`로 조회된 작업은 즉시 결과 또는 진단 ZIP을 받을 수 있습니다. ZIP 안의 `job.json`도 같은 최종 상태를 기록합니다.
 
@@ -132,3 +133,13 @@ Native 결과 계약은 다음과 같습니다.
 성공 ZIP에는 검증된 `result.brd`, `execution.log`, `generation.log`, `generation.report.json`, `result.json`, `manifest.json`, `agent-runner.log`, `job.json` 중 실제 생성된 파일이 들어갑니다. 실패·취소·중단 작업도 같은 endpoint에서 진단 ZIP을 받을 수 있지만 `result.brd`는 포함하지 않습니다.
 
 취소 시 Agent가 시작하고 추적 중인 프로세스만 종료합니다. Windows에서는 그 PID의 프로세스 트리를 `taskkill /PID <owned-pid> /T /F`로 종료하여 Allegro launcher의 자식 프로세스가 남지 않게 합니다. 번들 생성 중에는 parser 진행 콜백에서 취소를 확인하며, native 실행 직전에도 다시 확인합니다.
+
+### 기존 Allegro PID 모드
+
+`check_pid(pid)` 결과의 `creation_time`을 `allegro_creation_time` 옵션으로 전달하고 `allegro_pid`를 지정합니다. 이 모드에서는 BRD 업로드를 거부하고, `generate_bundle(..., session_mode=True)`를 호출합니다. 생성된 절대 경로의 `design.il`을 해당 PID 소유의 단일 Allegro 창에 `WM_COPYDATA`로 전달합니다. 명령, 경로, 스크립트 자체를 클라이언트에서 지정하는 API는 없습니다.
+
+`execution.started`는 진입 표식, `finished.flag`는 `result.json`을 닫은 이후 작성하는 완료 표식입니다. PID 모드 성공은 완료 표식, `status=success`, 0보다 큰 `result.brd`를 모두 요구하며 Allegro 종료 코드는 요구하지 않습니다. 대상 세션은 계속 실행됩니다. `design_modified`는 커밋 여부를, `recovery_brd`는 변경 전 백업 경로를 기록합니다. 커밋 후 저장 실패는 실패로 보고하되 변경된 설계를 자동으로 되돌리지 않습니다.
+
+취소는 `cancel.flag`로 요청합니다. SKILL은 시작 전과 변경 단위 사이, 커밋 전에 확인하고 가능한 트랜잭션을 롤백합니다. 기존 PID를 강제 종료하지 않습니다. 너무 늦은 취소 뒤 실제 저장이 성공하면 작업은 `succeeded`, `cancellation_too_late=true`로 남습니다. 메시지 전달 시간 초과는 완료 표식을 기다리며 자동 재전송하지 않습니다. 명령 진입을 60초 이내에 확인하지 못하면 취소 표식을 남겨 늦게 진입한 작업도 변경 전에 중단하게 합니다.
+
+진입 후 관찰 한도는 `AgentConfig.session_timeout_seconds`(기본 21,600초), 취소 확인 대기는 10초입니다. 한도 초과 또는 dispatch 이후 관찰 오류는 `interrupted`, `native_pending=true`, `design_modified=null`로 기록하여 native 실패와 구분합니다. 이후 상태·작업 목록·결과 조회에서 `finished.flag`가 발견되면 실제 native 결과로 상태와 ZIP을 갱신합니다. 이 경우에만 종료 상태가 나중에 변경될 수 있습니다. 관찰 재개나 결과 재확인은 명령을 다시 보내지 않습니다. 미완료 snapshot은 진단 ZIP에서 제외합니다. 최종 성공 판정은 결과 BRD 외에도 nonempty 백업, `design_modified=true`, 예상한 `recovery_brd` 경로를 요구합니다.

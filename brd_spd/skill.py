@@ -68,10 +68,13 @@ bsShape = nil
 bsPlanes = 0
 bsComponents = 0
 bsMissingComponents = 0
+bsLogPath = "execution.log"
+bsResultJsonPath = "result.json"
+bsResultBrdPath = "result.brd"
 
 procedure(bsLog(msg)
   let((port)
-    port = outfile("execution.log" "a")
+    port = outfile(bsLogPath "a")
     when(port
       fprintf(port "%s\n" msg)
       close(port)
@@ -86,13 +89,14 @@ procedure(bsError(message)
 
 procedure(bsResult(status errorText)
   let((port)
-    port = outfile("result.json" "w")
+    port = outfile(bsResultJsonPath "w")
     unless(port bsError("Cannot write result.json"))
     if(equal(status "success") then
-      fprintf(port "{\"status\":\"success\",\"result_brd\":\"result.brd\",\"execution_log\":\"execution.log\",\"planes_replaced\":%d,\"components_updated\":%d,\"components_missing\":%d}\n"
-        bsPlanes bsComponents bsMissingComponents)
+      fprintf(port "{\"status\":\"success\",\"result_brd\":\"%s\",\"execution_log\":\"%s\",\"planes_replaced\":%d,\"components_updated\":%d,\"components_missing\":%d}\n"
+        bsResultBrdPath bsLogPath bsPlanes bsComponents bsMissingComponents)
     else
-      fprintf(port "{\"status\":\"failed\",\"error\":\"%s\",\"execution_log\":\"execution.log\"}\n" errorText)
+      fprintf(port "{\"status\":\"%s\",\"error\":\"%s\",\"execution_log\":\"%s\"}\n"
+        status errorText bsLogPath)
     )
     close(port)
   )
@@ -255,6 +259,220 @@ bsRun()
 '''
 
 
+_SKILL_SESSION_SUPPORT = r'''
+bsCancelled = nil
+bsCommitted = nil
+bsRollbackFailed = nil
+bsBackupPath = __BS_BACKUP__
+bsCancelPath = __BS_CANCEL__
+bsFinishedPath = __BS_FINISHED__
+bsStartedPath = __BS_STARTED__
+
+procedure(bsResult(status errorText)
+  let((port modified)
+    port = outfile(bsResultJsonPath "w")
+    unless(port bsError("Cannot write result.json"))
+    modified = if(bsRollbackFailed then "null" else if(bsCommitted then "true" else "false"))
+    if(equal(status "success") then
+      fprintf(port "{\"status\":\"success\",\"result_brd\":\"%s\",\"execution_log\":\"%s\",\"planes_replaced\":%d,\"components_updated\":%d,\"components_missing\":%d,\"design_modified\":%s,\"recovery_brd\":\"%s\"}\n"
+        bsResultBrdPath bsLogPath bsPlanes bsComponents bsMissingComponents modified bsBackupPath)
+    else
+      fprintf(port "{\"status\":\"%s\",\"error\":\"%s\",\"execution_log\":\"%s\",\"design_modified\":%s,\"recovery_brd\":\"%s\"}\n"
+        status errorText bsLogPath modified bsBackupPath)
+    )
+    close(port)
+  )
+)
+
+procedure(bsTouch(path text)
+  let((port)
+    port = outfile(path "w")
+    unless(port bsError(sprintf(nil "Cannot write marker: %s" path)))
+    fprintf(port "%s\n" text)
+    close(port)
+  )
+)
+
+procedure(bsSessionPathsFree()
+  !isFile(__BS_LOG__) &&
+  !isFile(__BS_RESULT_JSON__) &&
+  !isFile(bsBackupPath) &&
+  !isFile(bsResultBrdPath) &&
+  !isFile(bsFinishedPath) &&
+  !isFile(bsStartedPath)
+)
+
+procedure(bsCheckCancel()
+  when(isFile(bsCancelPath)
+    bsCancelled = t
+    bsError("Cancellation requested")
+  )
+)
+'''
+
+
+_SKILL_SESSION_FOOTER = r'''procedure(bsMain()
+  let((currentDesign)
+    bsCheckCancel()
+    unless(axlOKToProceed(t)
+      bsError("Allegro is busy with another command or operation")
+    )
+    currentDesign = axlGetDrawingName()
+    unless(currentDesign bsError("No current Allegro drawing is available"))
+    bsMM = axlMKSConvert(1.0 "mm" car(axlDBGetDesignUnits()))
+    unless(bsMM bsError("Could not convert millimeters to active BRD units"))
+    bsLog(sprintf(nil "Using current open design: %s" currentDesign))
+    bsValidateAll()
+    bsCheckCancel()
+    bsLog("Saving recovery snapshot before native modifications")
+    unless(axlSaveDesign(?design bsBackupPath ?noMru t ?noConfirm t ?writeModel t)
+      bsError("Could not save session-before.brd recovery snapshot")
+    )
+    bsCheckCancel()
+    bsTxn = axlDBTransactionStart()
+    unless(bsTxn bsError("Could not start Allegro database transaction"))
+    bsApply()
+    bsCheckCancel()
+    unless(axlDBTransactionCommit(bsTxn)
+      bsError("Could not commit database transaction")
+    )
+    bsTxn = nil
+    bsCommitted = t
+    bsLog("Saving result.brd with Allegro database checks enabled")
+    unless(axlSaveDesign(?design bsResultBrdPath ?noMru t ?noConfirm t)
+      bsError("Could not save result.brd")
+    )
+    t
+  )
+)
+
+procedure(bsRun()
+  let((result rollback)
+    unless(bsSessionPathsFree()
+      printf("BRD-SPD session job refused: one or more output paths already exist.\n")
+      bsSessionBusy = nil
+      return(nil)
+    )
+    bsTouch(bsStartedPath "started")
+    result = errset(bsMain() t)
+    if(result then
+      bsLog("SUCCESS result.brd saved; Allegro session remains open")
+      bsResult("success" "")
+    else
+      when(bsTxn
+        rollback = errset(axlDBTransactionRollback(bsTxn) t)
+        unless(rollback && car(rollback)
+          bsRollbackFailed = t
+          bsLog("ROLLBACK FAILED; design modification state is unknown; recover with session-before.brd")
+        )
+        bsTxn = nil
+      )
+      if(bsCancelled && !bsRollbackFailed then
+        bsLog("CANCELLED; active transaction rolled back when possible")
+        bsResult("cancelled" "Cancellation requested; session remains open")
+      else
+        if(bsCommitted then
+          bsLog("FAILED after commit/save; current design remains modified; recover with session-before.brd")
+        else
+          bsLog("FAILED before commit; active transaction rolled back when possible; keep session-before.brd for recovery")
+        )
+        bsResult("failed" "SKILL execution failed; see execution.log and session-before.brd")
+      )
+    )
+    bsTouch(bsFinishedPath "finished")
+    bsSessionBusy = nil
+  )
+)
+
+bsRun()
+'''
+
+
+def _session_paths(output_dir: Path) -> dict[str, str]:
+    root = output_dir.resolve()
+    return {
+        "log": (root / "execution.log").as_posix(),
+        "result_json": (root / "result.json").as_posix(),
+        "backup": (root / "session-before.brd").as_posix(),
+        "cancel": (root / "cancel.flag").as_posix(),
+        "finished": (root / "finished.flag").as_posix(),
+        "started": (root / "execution.started").as_posix(),
+        "result_brd": (root / "result.brd").as_posix(),
+    }
+
+
+def _session_header(paths: dict[str, str]) -> str:
+    header = _SKILL_HEADER.replace(
+        'bsLogPath = "execution.log"', f"bsLogPath = {_skill_string(paths['log'])}"
+    )
+    header = header.replace(
+        'bsResultJsonPath = "result.json"',
+        f"bsResultJsonPath = {_skill_string(paths['result_json'])}",
+    )
+    header = header.replace(
+        'bsResultBrdPath = "result.brd"',
+        f"bsResultBrdPath = {_skill_string(paths['result_brd'])}",
+    )
+    header = header.replace(
+        "; base.brd must be supplied in this directory by the caller.",
+        "; Existing-session mode: operate on the current open drawing and keep Allegro open.",
+    )
+    support = _SKILL_SESSION_SUPPORT
+    for token, key in (
+        ("__BS_BACKUP__", "backup"),
+        ("__BS_CANCEL__", "cancel"),
+        ("__BS_FINISHED__", "finished"),
+        ("__BS_STARTED__", "started"),
+        ("__BS_LOG__", "log"),
+        ("__BS_RESULT_JSON__", "result_json"),
+    ):
+        support = support.replace(token, _skill_string(paths[key]))
+    return header + support
+
+
+def _session_busy_prefix(paths: dict[str, str]) -> str:
+    values = {key: _skill_string(value) for key, value in paths.items()}
+    return f'''if(boundp('bsSessionBusy) && bsSessionBusy then
+  let((port status message collision)
+    collision = isFile({values["log"]}) ||
+      isFile({values["result_json"]}) ||
+      isFile({values["backup"]}) ||
+      isFile({values["result_brd"]}) ||
+      isFile({values["finished"]}) ||
+      isFile({values["started"]})
+    if(collision then
+      printf("BRD-SPD session job refused: output paths already exist.\\n")
+    else
+      port = outfile({values["started"]} "w")
+      when(port fprintf(port "started\\n") close(port))
+      if(isFile({values["cancel"]}) then
+        status = "cancelled"
+        message = "Cancellation requested before execution"
+      else
+        status = "failed"
+        message = "Another BRD-SPD session job is active"
+      )
+      port = outfile({values["log"]} "w")
+      when(port fprintf(port "%s\\n" message) close(port))
+      port = outfile({values["result_json"]} "w")
+      when(port
+        fprintf(port "{{\\\"status\\\":\\\"%s\\\",\\\"error\\\":\\\"%s\\\",\\\"execution_log\\\":\\\"%s\\\",\\\"design_modified\\\":false,\\\"recovery_brd\\\":\\\"%s\\\"}}\\n"
+          status message {values["log"]} {values["backup"]})
+        close(port)
+      )
+      port = outfile({values["finished"]} "w")
+      when(port fprintf(port "finished\\n") close(port))
+    )
+  )
+else
+  progn(
+    bsSessionBusy = t
+'''
+
+
+_SKILL_SESSION_WRAPPER_SUFFIX = "  )\n)\n"
+
+
 def _selected_layer(requested: set[str] | None, original: str, native: str) -> bool:
     return requested is None or original.casefold() in requested or native.casefold() in requested
 
@@ -312,9 +530,11 @@ def _associate_voids(db, section: str, selected_nets: set[str] | None, report: _
     return positives
 
 
-def _write_plane_calls(handle, db, section, layer, selected_nets, report):
+def _write_plane_calls(handle, db, section, layer, selected_nets, report, *, session_mode=False):
     positives = _associate_voids(db, section, selected_nets, report)
     for rowid in positives:
+        if session_mode:
+            handle.write("    bsCheckCancel()\n")
         net, kind, encoded = db.execute(
             "SELECT net,kind,data FROM shapes WHERE rowid=?", (rowid,)
         ).fetchone()
@@ -392,6 +612,7 @@ def generate_bundle(
     layers: list[str] | None = None,
     nets: list[str] | None = None,
     update_components: bool = False,
+    session_mode: bool = False,
     progress=None,
 ) -> dict:
     """Create a conservative, unexecuted Allegro SKILL update bundle."""
@@ -483,6 +704,15 @@ def generate_bundle(
                 "NATIVE_PLANE_DELETE_SCOPE",
                 "Each selected ETCH/BOUNDARY layer+net shape set is replaced; review shape-based routing on those pairs",
             )
+            if session_mode:
+                report.warn(
+                    "NATIVE_EXISTING_SESSION_MODE",
+                    "The selected Allegro process current open design is the source; execution first writes session-before.brd",
+                )
+                report.warn(
+                    "NATIVE_SESSION_DYNAMIC_REPOUR_DEFERRED",
+                    "Session mode does not globally repour unrelated dynamic shapes; review or update them in Allegro after the scoped result",
+                )
             report.warn(
                 "NATIVE_DYNAMIC_PLANE_RULES_NOT_RESTORED",
                 "Selected planes become static copper with explicit voids. Original dynamic boundaries, "
@@ -510,18 +740,33 @@ def generate_bundle(
                 )
 
             design_path = output_dir / "design.il"
+            runtime_paths = _session_paths(output_dir) if session_mode else None
             with design_path.open("w", encoding="utf-8", newline="\n") as skill:
-                skill.write(_SKILL_HEADER)
+                if session_mode:
+                    skill.write(_session_busy_prefix(runtime_paths))
+                    skill.write(_session_header(runtime_paths))
+                else:
+                    skill.write(_SKILL_HEADER)
                 skill.write("\nprocedure(bsValidateAll()\n")
                 for layer, net in sorted(pairs, key=lambda item: (item[0].casefold(), item[1].casefold())):
                     skill.write(f"  bsValidate({_skill_string(layer)} {_skill_string(net)})\n")
                 skill.write("  t\n)\n\nprocedure(bsApply()\n  progn(\n")
                 for layer, net in sorted(pairs, key=lambda item: (item[0].casefold(), item[1].casefold())):
+                    if session_mode:
+                        skill.write("    bsCheckCancel()\n")
                     skill.write(f"    bsDeletePlane({_skill_string(layer)} {_skill_string(net)})\n")
                 for index, (section, _original, native) in enumerate(sections, 1):
                     if progress:
                         progress(f"Native bundle: plane section {index}/{len(sections)}")
-                    _write_plane_calls(skill, db, section, native, requested_nets, report)
+                    _write_plane_calls(
+                        skill,
+                        db,
+                        section,
+                        native,
+                        requested_nets,
+                        report,
+                        session_mode=session_mode,
+                    )
                 if update_components:
                     if len(conductor_order) < 2:
                         raise ValueError("Component side validation requires distinct outer conductor layers")
@@ -536,6 +781,8 @@ def generate_bundle(
                             raise ValueError(
                                 f"Component {refdes!r} has missing or unsupported placement layer {component_layer!r}"
                             )
+                        if session_mode:
+                            skill.write("    bsCheckCancel()\n")
                         skill.write(
                             f"    bsUpdateComponent({_skill_string(refdes)} {_num(component['x'])} "
                             f"{_num(component['y'])} {_num(component.get('rotation', 0.0))} "
@@ -543,22 +790,44 @@ def generate_bundle(
                         )
                     report.counts["component_updates_requested"] = component_count
                 skill.write("    t\n  )\n)\n\n")
-                skill.write(_SKILL_FOOTER)
+                skill.write(_SKILL_SESSION_FOOTER if session_mode else _SKILL_FOOTER)
+                if session_mode:
+                    skill.write(_SKILL_SESSION_WRAPPER_SUFFIX)
 
-            (output_dir / "run.scr").write_text('skill load("design.il")\nexit\n', encoding="ascii")
+            if session_mode:
+                from .process_target import _encode_command
+                dispatch_command = f"skill load({_skill_string(design_path.resolve().as_posix())})\n"
+                _encode_command(dispatch_command.rstrip("\n"))
+                (output_dir / "run.scr").write_text(dispatch_command, encoding="utf-8")
+            else:
+                dispatch_command = None
+                (output_dir / "run.scr").write_text(
+                    'skill load("design.il")\nexit\n', encoding="ascii"
+                )
             manifest = {
                 "schema_version": 1,
                 "backend": "allegro-24.1-skill",
                 "generated_utc": datetime.now(timezone.utc).isoformat(),
                 "status": "generated_unverified",
-                "base_brd": "caller_supplied",
-                "result_brd": "result.brd",
-                "execution_result": "result.json",
+                "base_brd": "current_open_design" if session_mode else "caller_supplied",
+                "result_brd": runtime_paths["result_brd"] if session_mode else "result.brd",
+                "execution_result": runtime_paths["result_json"] if session_mode else "result.json",
                 "plane_mode": "replace_static_etch_shapes",
+                "session_mode": bool(session_mode),
                 "selected_pairs": [{"layer": layer, "net": net} for layer, net in sorted(pairs)],
                 "update_existing_components": bool(update_components),
                 "unsupported": ["trace_deltas", "via_deltas", "component_add_delete", "component_side_change"],
             }
+            if session_mode:
+                manifest.update(
+                    {
+                        "dispatch_command": dispatch_command.rstrip("\n"),
+                        "recovery_brd": runtime_paths["backup"],
+                        "cancel_flag": runtime_paths["cancel"],
+                        "started_marker": runtime_paths["started"],
+                        "finished_marker": runtime_paths["finished"],
+                    }
+                )
             (output_dir / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -575,6 +844,7 @@ def generate_bundle(
                     "manifest_path": str((output_dir / "manifest.json").resolve()),
                     "selected_pairs": selected_pairs,
                     "update_existing_components": bool(update_components),
+                    "session_mode": bool(session_mode),
                 },
             )
         finally:

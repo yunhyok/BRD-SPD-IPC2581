@@ -69,7 +69,7 @@ def _job_id(value: str) -> str:
 def _safe_options(options: Any) -> dict[str, Any]:
     if not isinstance(options, dict):
         raise ValueError("options must be an object")
-    unknown = set(options) - {"layers", "nets", "update_components"}
+    unknown = set(options) - {"layers", "nets", "update_components", "allegro_pid", "allegro_creation_time"}
     if unknown:
         raise ValueError("unsupported option(s): " + ", ".join(sorted(unknown)))
     result: dict[str, Any] = {}
@@ -85,6 +85,16 @@ def _safe_options(options: Any) -> dict[str, Any]:
         if not isinstance(options["update_components"], bool):
             raise ValueError("update_components must be boolean")
         result["update_components"] = options["update_components"]
+    if "allegro_pid" in options:
+        pid = options["allegro_pid"]
+        if type(pid) is not int or not 1 <= pid <= 0xFFFFFFFF:
+            raise ValueError("allegro_pid must be an integer between 1 and 4294967295")
+        result["allegro_pid"] = pid
+    if "allegro_creation_time" in options:
+        created = options["allegro_creation_time"]
+        if "allegro_pid" not in result or type(created) is not int or not 0 < created < 2**64:
+            raise ValueError("allegro_creation_time requires allegro_pid and a positive FILETIME integer")
+        result["allegro_creation_time"] = created
     return result
 
 
@@ -153,6 +163,7 @@ class AgentConfig:
     allegro_exe: Path | None = None
     allowed_clients: list[str] | None = None
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD
+    session_timeout_seconds: float = 6 * 60 * 60
 
     def __post_init__(self) -> None:
         self.datadir = Path(self.datadir).resolve()
@@ -162,6 +173,8 @@ class AgentConfig:
             raise ValueError("port must be between 0 and 65535")
         if self.max_upload_bytes <= 0:
             raise ValueError("max_upload_bytes must be positive")
+        if not 0 < self.session_timeout_seconds <= 7 * 24 * 60 * 60:
+            raise ValueError("session_timeout_seconds must be positive and at most seven days")
 
 
 class _AgentServer(ThreadingHTTPServer):
@@ -208,6 +221,7 @@ class WorkstationAgent:
         self._cancel: dict[str, threading.Event] = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._active_uploads: set[tuple[str, str]] = set()
+        self._reconciling: set[str] = set()
         self._server: _AgentServer | None = None
         self._server_thread: threading.Thread | None = None
         self._worker_thread: threading.Thread | None = None
@@ -335,8 +349,9 @@ class WorkstationAgent:
             if not self._started:
                 return
             self._stopping.set()
-            for event in self._cancel.values():
+            for job_id, event in list(self._cancel.items()):
                 event.set()
+                self._signal_session_cancel(job_id)
             for process in list(self._processes.values()):
                 self._terminate(process)
             server = self._server
@@ -352,7 +367,7 @@ class WorkstationAgent:
             if self._worker_thread and self._worker_thread.is_alive():
                 self._server = None
                 self._server_thread = None
-                raise RuntimeError("agent runner did not stop; it remains blocked in bundle generation")
+                raise RuntimeError("agent runner is awaiting cooperative cancellation; an existing Allegro session will not be terminated")
             self._server = None
             self._server_thread = None
             self._worker_thread = None
@@ -374,6 +389,14 @@ class WorkstationAgent:
             except (ValueError, OSError, json.JSONDecodeError):
                 continue
             if state.get("status") in {"running", "cancel_requested"}:
+                if state.get("session_dispatched"):
+                    # Resume observation, never send the command a second time.
+                    event = self._cancel.setdefault(job_id, threading.Event())
+                    if state["status"] == "cancel_requested":
+                        event.set()
+                    self._update(job_id, status="queued")
+                    self._queue.put(job_id)
+                    continue
                 self._finish(job_id, directory / "bundle", "interrupted", include_board=False,
                              error="agent restarted during execution")
             elif state.get("status") == "queued":
@@ -384,9 +407,12 @@ class WorkstationAgent:
 
     def _state(self, job_id: str) -> dict[str, Any]:
         path = self._job_dir(job_id) / "job.json"
-        if not path.is_file():
-            raise FileNotFoundError("job not found")
-        state = json.loads(path.read_text(encoding="utf-8"))
+        # Windows can reject reads while another thread replaces this file.
+        # Use the same lock as state writers for the short filesystem access.
+        with self._lock:
+            if not path.is_file():
+                raise FileNotFoundError("job not found")
+            state = json.loads(path.read_text(encoding="utf-8"))
         if state.get("status") not in _JOB_STATES:
             raise ValueError("invalid persisted job state")
         return state
@@ -404,6 +430,9 @@ class WorkstationAgent:
 
     def create_job(self, options: Any) -> dict[str, Any]:
         options = _safe_options(options)
+        target = self.check_pid(options["allegro_pid"]) if "allegro_pid" in options else None
+        if target is not None and options.get("allegro_creation_time", target["creation_time"]) != target["creation_time"]:
+            raise ValueError("Allegro PID was reused since validation; check the intended session again")
         job_id = str(uuid.uuid4())
         directory = self._jobs_dir / job_id
         directory.mkdir()
@@ -413,9 +442,21 @@ class WorkstationAgent:
             "uploads": {"spd": False, "brd": False},
             "created_utc": now, "updated_utc": now,
         }
+        if target is not None:
+            state["target_process"] = target
         _atomic_json(directory / "job.json", state)
         (directory / "runner.log").touch()
         return self._public(state)
+
+    def _allegro_executable(self) -> Path:
+        return self.config.allegro_exe or Path(r"C:\Cadence\SPB_24.1\tools\bin\allegro.exe")
+
+    def check_pid(self, pid: int, expected_identity: dict | None = None) -> dict:
+        from .process_target import validate_target
+        executable = self._allegro_executable()
+        if executable.name.lower() != "allegro.exe":
+            raise ValueError("PID mode requires the configured allegro.exe executable")
+        return validate_target(pid, executable, expected_identity)
 
     def upload(self, job_id: str, slot: str, source, size: int) -> dict[str, Any]:
         if slot not in _SLOTS:
@@ -427,6 +468,8 @@ class WorkstationAgent:
             state = self._state(job_id)
             if state["status"] != "created":
                 raise RuntimeError("uploads are accepted only while a job is created")
+            if slot == "brd" and "allegro_pid" in state["options"]:
+                raise ValueError("PID mode uses the BRD already open in Allegro; do not upload a base BRD")
             if active in self._active_uploads:
                 raise RuntimeError("an upload for this slot is already active")
             self._active_uploads.add(active)
@@ -462,8 +505,11 @@ class WorkstationAgent:
                 raise RuntimeError("job is not in created state")
             if any(active_job == job_id for active_job, _ in self._active_uploads):
                 raise RuntimeError("job has an active upload")
-            if not all(state["uploads"].get(slot) for slot in _SLOTS):
-                raise RuntimeError("both spd and brd uploads are required")
+            required = ("spd",) if "allegro_pid" in state["options"] else _SLOTS
+            if not all(state["uploads"].get(slot) for slot in required):
+                raise RuntimeError("required uploads are missing: " + ", ".join(required))
+            if "allegro_pid" in state["options"]:
+                self.check_pid(state["options"]["allegro_pid"], state["target_process"])
             state = self._update(job_id, status="queued")
             self._cancel[job_id] = threading.Event()
             self._queue.put(job_id)
@@ -476,7 +522,8 @@ class WorkstationAgent:
                 return self._public(state)
             event = self._cancel.setdefault(job_id, threading.Event())
             event.set()
-            if state["status"] in {"created", "queued"}:
+            self._signal_session_cancel(job_id)
+            if state["status"] in {"created", "queued"} and not state.get("session_dispatched"):
                 self._update(job_id, status="cancel_requested")
                 self._log(job_id, "job cancelled before native execution")
                 return self._finish(job_id, self._job_dir(job_id) / "bundle", "cancelled",
@@ -486,6 +533,11 @@ class WorkstationAgent:
         if process is not None:
             self._terminate(process)
         return self._public(state)
+
+    def _signal_session_cancel(self, job_id: str) -> None:
+        bundle = self._job_dir(job_id) / "bundle"
+        if "allegro_pid" in self._state(job_id)["options"] and bundle.is_dir():
+            (bundle / "cancel.flag").touch()
 
     def _log(self, job_id: str, message: str) -> None:
         line = f"{_utcnow()} {message.rstrip()}\n"
@@ -499,19 +551,24 @@ class WorkstationAgent:
                 return
             try:
                 state = self._state(job_id)
-                if state["status"] != "queued":
+                if state["status"] != "queued" and not (
+                        state["status"] == "cancel_requested" and state.get("session_dispatched")):
                     continue
                 self._run(job_id)
             except _Cancelled:
-                self._log(job_id, "job cancelled during bundle generation")
+                self._log(job_id, "job cancelled before native execution")
                 directory = self._job_dir(job_id)
                 self._finish(job_id, directory / "bundle", "cancelled", include_board=False)
             except BaseException as exc:
                 try:
                     self._log(job_id, f"agent failure: {exc}")
                     directory = self._job_dir(job_id)
-                    self._finish(job_id, directory / "bundle", "failed", include_board=False,
-                                 error=str(exc))
+                    dispatched = self._state(job_id).get("session_dispatched", False)
+                    if dispatched:
+                        self._signal_session_cancel(job_id)
+                    self._finish(job_id, directory / "bundle", "interrupted" if dispatched else "failed",
+                                 include_board=False, honor_cancel=not dispatched, error=str(exc),
+                                 native_pending=dispatched, design_modified=None)
                 except BaseException:
                     pass
 
@@ -530,11 +587,12 @@ class WorkstationAgent:
             layers=options.get("layers"),
             nets=options.get("nets"),
             update_components=options.get("update_components", False),
+            session_mode="allegro_pid" in options,
             progress=progress,
         )
 
     def _allegro_command(self, bundle: Path) -> list[str]:
-        executable = self.config.allegro_exe or Path(r"C:\Cadence\SPB_24.1\tools\bin\allegro.exe")
+        executable = self._allegro_executable()
         executable = Path(executable).resolve()
         if not executable.is_file():
             raise FileNotFoundError(f"Allegro executable not found: {executable}")
@@ -581,6 +639,11 @@ class WorkstationAgent:
         bundle = directory / "bundle"
         event = self._cancel.setdefault(job_id, threading.Event())
         self._update(job_id, status="running", started_utc=_utcnow())
+        state = self._state(job_id)
+        if state.get("session_dispatched"):
+            self._log(job_id, "resuming existing-session observation without re-dispatch")
+            self._monitor_session(job_id, bundle, state)
+            return
         self._log(job_id, "generating constrained native bundle")
         if bundle.exists():
             raise RuntimeError("job bundle already exists; jobs cannot be retried in place")
@@ -589,11 +652,14 @@ class WorkstationAgent:
         if isinstance(generation, dict) and (
                 generation.get("status") == "failed" or generation.get("success") is False):
             raise RuntimeError(f"native bundle generation failed: {generation.get('error', 'unknown error')}")
-        shutil.copy2(directory / "base.brd", bundle / "base.brd")
         if event.is_set() or self._stopping.is_set():
             self._log(job_id, "job cancelled before native execution")
             self._finish(job_id, bundle, "cancelled", include_board=False)
             return
+        if "allegro_pid" in state["options"]:
+            self._run_session(job_id, bundle, state)
+            return
+        shutil.copy2(directory / "base.brd", bundle / "base.brd")
         command = self._allegro_command(bundle)
         self._log(job_id, "starting Allegro: " + " ".join(Path(x).name if i == 0 else x for i, x in enumerate(command)))
         log_path = directory / "runner.log"
@@ -633,6 +699,95 @@ class WorkstationAgent:
         self._finish(job_id, bundle, "succeeded", include_board=True,
                      return_code=return_code, result_bytes=board_path.stat().st_size)
 
+    def _dispatch_session(self, state: dict, command: str) -> dict:
+        from .process_target import dispatch_command
+        return dispatch_command(state["options"]["allegro_pid"], self._allegro_executable(),
+                                state["target_process"], command)
+
+    def _run_session(self, job_id: str, bundle: Path, state: dict) -> None:
+        from .skill import _skill_string
+        pid = state["options"]["allegro_pid"]
+        self.check_pid(pid, state["target_process"])
+        if not (bundle / "design.il").is_file():
+            raise FileNotFoundError("native bundle did not create design.il")
+        command = "skill load(" + _skill_string((bundle / "design.il").as_posix()) + ")"
+        with self._lock:
+            if self._cancel[job_id].is_set() or self._stopping.is_set():
+                raise _Cancelled("cancelled before dispatch")
+            self._update(job_id, session_dispatched=True)
+        self._log(job_id, f"dispatching to existing Allegro PID {pid}; using its currently open BRD")
+        delivery = self._dispatch_session(state, command)
+        self._update(job_id, delivery=delivery)
+        if delivery["timed_out"]:
+            self._log(job_id, "message delivery timed out; awaiting native markers without resending")
+        self._monitor_session(job_id, bundle, state)
+
+    def _monitor_session(self, job_id: str, bundle: Path, state: dict) -> None:
+        event = self._cancel.setdefault(job_id, threading.Event())
+        deadline = time.monotonic() + 60
+        completion_deadline = time.monotonic() + self.config.session_timeout_seconds
+        cancellation_deadline = None
+        next_identity_check = 0.0
+        native_offset = 0
+        with (self._job_dir(job_id) / "runner.log").open("ab", buffering=0) as log_stream:
+            while not (bundle / "finished.flag").is_file():
+                native_offset = self._copy_native_log(bundle / "execution.log", log_stream, native_offset)
+                if event.is_set() or self._stopping.is_set():
+                    self._signal_session_cancel(job_id)
+                    if cancellation_deadline is None:
+                        cancellation_deadline = time.monotonic() + 10
+                if time.monotonic() >= next_identity_check:
+                    try:
+                        self.check_pid(state["options"]["allegro_pid"], state["target_process"])
+                    except (OSError, RuntimeError):
+                        # The user may close Allegro just after the native
+                        # script writes its completion marker.
+                        if (bundle / "finished.flag").is_file():
+                            break
+                        raise
+                    next_identity_check = time.monotonic() + 2
+                if not (bundle / "execution.started").is_file() and (
+                        time.monotonic() >= deadline or self._stopping.is_set()):
+                    self._signal_session_cancel(job_id)
+                    raise RuntimeError("Allegro did not confirm script entry; cancellation marker left for any late execution")
+                if time.monotonic() >= completion_deadline or (
+                        cancellation_deadline is not None and time.monotonic() >= cancellation_deadline):
+                    self._signal_session_cancel(job_id)
+                    raise RuntimeError("Native completion is unconfirmed; Allegro remains open. Check this job again to collect any later native result")
+                time.sleep(0.2)
+            self._copy_native_log(bundle / "execution.log", log_stream, native_offset)
+        self._complete_session(job_id, bundle)
+
+    def _complete_session(self, job_id: str, bundle: Path, reconcile: bool = False) -> None:
+        try:
+            result = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            result = {"status": "invalid_result"}
+        if not isinstance(result, dict):
+            result = {"status": "invalid_result"}
+        status = result.get("status")
+        board = bundle / "result.brd"
+        backup = bundle / "session-before.brd"
+        updates = {"reconcile": reconcile, "native_pending": False,
+                   "design_modified": result.get("design_modified"), "error": None}
+        if status == "cancelled":
+            self._log(job_id, "existing-session job cancelled cooperatively; Allegro remains open")
+            self._finish(job_id, bundle, "cancelled", include_board=False,
+                         **updates)
+        elif (status == "success" and board.is_file() and board.stat().st_size
+              and backup.is_file() and backup.stat().st_size
+              and result.get("design_modified") is True
+              and result.get("recovery_brd") == backup.as_posix()):
+            self._log(job_id, "existing-session conversion succeeded; Allegro remains open")
+            self._finish(job_id, bundle, "succeeded", include_board=True, honor_cancel=False,
+                         result_bytes=board.stat().st_size,
+                         cancellation_too_late=(bundle / "cancel.flag").is_file(), **updates)
+        else:
+            message = f"existing-session native run failed or recovery contract incomplete: status={status!r}; see execution.log"
+            self._log(job_id, message)
+            self._finish(job_id, bundle, "failed", include_board=False, honor_cancel=False,
+                         **dict(updates, error=message))
+
     @staticmethod
     def _copy_native_log(source: Path, destination, offset: int) -> int:
         if not source.is_file():
@@ -647,7 +802,7 @@ class WorkstationAgent:
             return stream.tell()
 
     def _finish(self, job_id: str, bundle: Path, status: str, include_board: bool,
-                **updates) -> dict[str, Any]:
+                honor_cancel: bool = True, reconcile: bool = False, **updates) -> dict[str, Any]:
         """Publish the archive before making a terminal state observable."""
         if status not in _TERMINAL_STATES:
             raise ValueError("finish status must be terminal")
@@ -655,7 +810,7 @@ class WorkstationAgent:
         while True:
             state = self._state(job_id)
             chosen_status, chosen_board = status, include_board
-            if state["status"] == "cancel_requested" and status not in {"cancelled", "interrupted"}:
+            if honor_cancel and state["status"] == "cancel_requested" and status not in {"cancelled", "interrupted"}:
                 chosen_status, chosen_board = "cancelled", False
             final = dict(state)
             final.update(updates)
@@ -663,10 +818,11 @@ class WorkstationAgent:
             self._make_result_archive(directory, bundle, chosen_board, job_state=final)
             with self._lock:
                 current = self._state(job_id)
-                if (current["status"] == "cancel_requested" and
+                if (honor_cancel and current["status"] == "cancel_requested" and
                         chosen_status not in {"cancelled", "interrupted"}):
                     continue
-                if current["status"] in _TERMINAL_STATES:
+                if current["status"] in _TERMINAL_STATES and not (
+                        reconcile and current["status"] == "interrupted" and current.get("native_pending")):
                     return self._public(current)
                 _atomic_json(directory / "job.json", final)
                 return self._public(final)
@@ -685,6 +841,10 @@ class WorkstationAgent:
                 (bundle / "manifest.json", "manifest.json"),
                 (bundle / "result.json", "result.json"),
             ]
+            # A snapshot may still be saving while native execution is unknown.
+            # Include it only after a native terminal marker, when it is stable.
+            if not (job_state or {}).get("native_pending"):
+                candidates.append((bundle / "session-before.brd", "session-before.brd"))
             if include_board:
                 candidates.insert(0, (bundle / "result.brd", "result.brd"))
             for source, name in candidates:
@@ -700,6 +860,19 @@ class WorkstationAgent:
         return destination
 
     def get_job(self, job_id: str) -> dict[str, Any]:
+        state = self._state(job_id)
+        bundle = self._job_dir(job_id) / "bundle"
+        if state["status"] == "interrupted" and state.get("native_pending") and (bundle / "finished.flag").is_file():
+            with self._lock:
+                reconcile = job_id not in self._reconciling
+                if reconcile:
+                    self._reconciling.add(job_id)
+            if reconcile:
+                try:
+                    self._complete_session(job_id, bundle, reconcile=True)
+                finally:
+                    with self._lock:
+                        self._reconciling.discard(job_id)
         return self._public(self._state(job_id))
 
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -710,7 +883,7 @@ class WorkstationAgent:
             if not directory.is_dir():
                 continue
             try:
-                states.append(self._public(self._state(directory.name)))
+                states.append(self.get_job(directory.name))
             except (ValueError, OSError, FileNotFoundError, json.JSONDecodeError):
                 continue
         states.sort(key=lambda item: item.get("updated_utc", ""), reverse=True)
@@ -730,13 +903,16 @@ class WorkstationAgent:
         return {"text": data.decode("utf-8", "replace"), "next_offset": next_offset}
 
     def result_path(self, job_id: str) -> Path:
-        state = self._state(job_id)
+        state = self.get_job(job_id)
+        with self._lock:
+            if job_id in self._reconciling:
+                raise RuntimeError("result archive refresh is in progress; retry after checking job status")
         if state["status"] not in _TERMINAL_STATES:
             raise RuntimeError("result archive is available only for a terminal job")
         path = self._job_dir(job_id) / "result.zip"
         if not path.is_file():
             self._make_result_archive(self._job_dir(job_id), self._job_dir(job_id) / "bundle",
-                                      include_board=state["status"] == "succeeded")
+                                      include_board=state["status"] == "succeeded", job_state=state)
         return path
 
     def client_allowed(self, address: str) -> bool:
@@ -797,7 +973,11 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parts == ["v1", "health"]:
                 self._json(200, {"status": "ok", "protocol": PROTOCOL_VERSION, "runner_slots": 1,
-                                 "max_upload_bytes": self.agent.config.max_upload_bytes})
+                                 "max_upload_bytes": self.agent.config.max_upload_bytes,
+                                 "capabilities": ["allegro_pid"]})
+                return
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["v1", "allegro"]:
+                self._json(200, self.agent.check_pid(int(parts[2])))
                 return
             if method == "GET" and parts == ["v1", "jobs"]:
                 query = parse_qs(parsed.query)
@@ -841,6 +1021,8 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"error": str(exc)})
         except RuntimeError as exc:
+            self._json(409, {"error": str(exc)})
+        except OSError as exc:
             self._json(409, {"error": str(exc)})
 
     def do_GET(self):
@@ -911,6 +1093,10 @@ class RemoteClient:
     def health(self):
         return self._json_call("GET", "/v1/health")
 
+    def check_pid(self, pid: int) -> dict:
+        pid = _safe_options({"allegro_pid": pid})["allegro_pid"]
+        return self._json_call("GET", f"/v1/allegro/{pid}")
+
     def create_job(self, options: dict) -> dict:
         result = self._json_call("POST", "/v1/jobs", {"options": options})
         return {"id": result["id"], "status": result["status"]}
@@ -922,6 +1108,8 @@ class RemoteClient:
         job_id = _job_id(job_id)
         if slot not in _SLOTS:
             raise ValueError("slot must be 'spd' or 'brd'")
+        if slot == "brd" and "allegro_pid" in self.get_job(job_id)["options"]:
+            raise ValueError("PID mode uses the BRD already open in Allegro; do not upload a base BRD")
         path = Path(path)
         size = path.stat().st_size
         maximum = int(self.health()["max_upload_bytes"])

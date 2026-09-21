@@ -8,9 +8,11 @@
 
 ## 설치와 실행
 
-1. [Releases](https://github.com/yunhyok/BRD-SPD-IPC2581/releases)의 `BRD-SPD-IPC2581-Setup-0.2.0.exe`를 노트북과 워크스테이션에 설치합니다. 별도 Python 설치는 필요하지 않습니다.
+1. [Releases](https://github.com/yunhyok/BRD-SPD-IPC2581/releases)의 `BRD-SPD-IPC2581-Setup-0.3.0.exe`를 노트북과 워크스테이션에 설치합니다. 별도 Python 설치는 필요하지 않습니다.
 2. 워크스테이션에서 **Workstation Agent**를 열어 Allegro 실행 파일을 지정하고 서버를 시작합니다. 화면에 표시된 접속 토큰과 인증서 지문을 노트북에 입력합니다.
-3. 노트북의 **BRD-SPD-IPC2581 → 원격 작업**에서 워크스테이션 IP, SPD, 동일 보드의 원본 BRD를 지정하여 실행합니다. 진행 로그를 확인하고 완료 후 결과 ZIP을 다운로드합니다.
+3. 노트북의 **BRD-SPD-IPC2581 → 원격 작업**에서 워크스테이션 IP와 SPD를 지정합니다. **Allegro PID**를 입력하면 해당 프로세스에 현재 열린 BRD에 반영합니다. PID를 비우면 업로드한 원본 BRD로 새 Allegro를 실행합니다. 진행 로그를 확인하고 완료 후 결과 ZIP을 다운로드합니다.
+
+PID는 워크스테이션 작업 관리자의 **세부 정보 → allegro.exe → PID**에서 확인합니다. **PID 확인** 후 실행하면 프로세스 경로와 생성 시각까지 대조하여 재사용된 PID를 거부합니다. PID 모드에서는 변경 전 상태를 `session-before.brd`에 백업하고, 완료 후 `result.brd`를 해당 Allegro 창에 열어 둡니다. 에이전트와 Allegro는 같은 Windows 로그인 세션 및 권한 수준에서 실행하세요. PID는 프로그램을 다시 열 때 자동 복원하지 않습니다.
 
 IP는 언제든 바꿀 수 있습니다. 인증서와 토큰은 워크스테이션의 작업 폴더에 보관되므로 IP만 변경된 경우 다시 발급할 필요가 없습니다. Allegro 기본 경로는 `C:\Cadence\SPB_24.1\tools\bin\allegro.exe`입니다. 에이전트가 실행 중인 Windows 사용자에게 Allegro 라이선스와 보드 접근 권한이 있어야 합니다.
 
@@ -22,14 +24,14 @@ IP는 언제든 바꿀 수 있습니다. 인증서와 토큰은 워크스테이�
 
 ```mermaid
 flowchart LR
-    L[노트북: SPD + 원본 BRD] -->|인증된 HTTPS| W[워크스테이션 에이전트]
+    L[노트북: SPD + PID 또는 원본 BRD] -->|인증된 HTTPS| W[워크스테이션 에이전트]
     W --> S[SKILL 생성 + 손실 보고서]
-    S --> A[Allegro 24.1 실행]
+    S --> A[지정 PID 또는 새 Allegro 24.1]
     A --> R[새 result.brd + 실행 로그]
     R -->|조회·다운로드| L
 ```
 
-원격 통신은 인증서 지문을 고정한 HTTPS와 접속 토큰을 사용합니다. 워크스테이션에서 허용할 노트북 IP를 선택적으로 제한할 수 있습니다. 노트북은 서버를 열지 않습니다. 작업마다 별도 디렉터리와 원본의 복사본을 사용하고 Allegro는 한 번에 한 작업만 실행합니다.
+원격 통신은 인증서 지문을 고정한 HTTPS와 접속 토큰을 사용합니다. 워크스테이션에서 허용할 노트북 IP를 선택적으로 제한할 수 있습니다. 노트북은 서버를 열지 않습니다. 작업마다 별도 디렉터리와 복사본 또는 변경 전 백업을 사용하고 에이전트는 한 번에 한 작업만 실행합니다.
 
 IPC 경로에서는 참조 XML의 동박/배선 형상을 복사하지 않습니다. 물리 형상은 SPD에서 생성합니다. 참조 XML의 BOM은 변경 전 정보일 수 있으므로 복사하지 않고 로그에 기록합니다. 참조 XML이 없거나 외곽선이 비어 있으면 보드 크기를 추측하지 않습니다.
 
@@ -51,6 +53,8 @@ python launch_cli.py skill edited.spd -o skill-bundle --layer TOP --net VCC
 python launch_cli.py serve --host 0.0.0.0 --port 8765 --allegro-exe "C:\Cadence\SPB_24.1\tools\bin\allegro.exe"
 python launch_cli.py remote --host WORKSTATION_IP --token-file pairing-token.txt --fingerprint CERT_SHA256 health
 python launch_cli.py remote --host WORKSTATION_IP --token-file pairing-token.txt --fingerprint CERT_SHA256 submit edited.spd --base-brd original.brd
+python launch_cli.py remote --host WORKSTATION_IP --token-file pairing-token.txt --fingerprint CERT_SHA256 check-pid 12345
+python launch_cli.py remote --host WORKSTATION_IP --token-file pairing-token.txt --fingerprint CERT_SHA256 submit edited.spd --allegro-pid 12345
 ```
 
 `remote status`, `remote logs`, `remote cancel`, `remote download`에 반환된 작업 ID를 전달합니다. 토큰은 명령행 문자열 대신 파일 또는 `BRDSPD_TOKEN` 환경변수로 제공하여 셸 기록에 남기지 않습니다.
@@ -81,7 +85,7 @@ python -m pytest -q
 
 Inno Setup 6 또는 7이 필요합니다. GitHub Actions에서도 테스트와 Windows 설치파일을 빌드합니다. 실제 고객 설계 파일은 저장소·설치파일에 포함하지 않으며, 테스트는 합성 데이터만 사용합니다.
 
-원격 테스트는 HTTPS, 파일 전달, 작업 상태, 취소, 로그와 결과 수집을 로컬 합성 실행기로 검증합니다. 이것이 Allegro에서 실제 설계를 재구성했다는 증거는 아닙니다. 실제 워크스테이션에서 생성된 `execution.log`, `result.json`, `result.brd` 및 Allegro DRC/설계 비교로 확인해야 합니다.
+원격 테스트는 HTTPS, 파일 전달, 작업 상태, 취소, 로그와 결과 수집을 로컬 합성 실행기로 검증합니다. 실제 Windows 테스트 창 두 개로 PID별 메시지 전달도 검증합니다. 이것이 Allegro에서 실제 설계를 재구성했다는 증거는 아닙니다. 실제 워크스테이션에서 생성된 `execution.log`, `result.json`, `result.brd` 및 Allegro DRC/설계 비교로 확인해야 합니다.
 
 ## 라이선스와 출처
 

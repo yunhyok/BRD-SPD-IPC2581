@@ -23,6 +23,34 @@ class _UserCancelled(RuntimeError):
     """Internal worker signal used to stop an in-progress network upload."""
 
 
+def parse_allegro_pid(value: str) -> int | None:
+    """Parse an optional Windows PID without retaining it in user settings."""
+    text = value.strip()
+    if not text:
+        return None
+    if not text.isdecimal():
+        raise ValueError("Allegro PID는 양의 정수여야 합니다.")
+    pid = int(text)
+    if not 1 <= pid <= 0xFFFFFFFF:
+        raise ValueError("Allegro PID 범위가 올바르지 않습니다.")
+    return pid
+
+
+def pid_identity_key(host: str, port: int, fingerprint: str, pid: int) -> tuple[str, int, str, int]:
+    """Key a one-session PID validation; it is intentionally never persisted."""
+    return (host.strip().casefold(), int(port), fingerprint.replace(":", "").strip().casefold(), int(pid))
+
+
+def checked_creation_time(identity: Any, pid: int) -> int:
+    """Reject incomplete or mismatched agent PID checks before creating a job."""
+    if not isinstance(identity, dict) or identity.get("pid") != pid:
+        raise ValueError("Agent PID 확인 결과가 요청한 PID와 일치하지 않습니다.")
+    creation = identity.get("creation_time")
+    if isinstance(creation, bool) or not isinstance(creation, int) or creation <= 0:
+        raise ValueError("Agent PID 확인 결과에 유효한 생성 시간이 없습니다.")
+    return creation
+
+
 def settings_file() -> Path:
     """Return the per-user, non-secret GUI settings location."""
     base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
@@ -278,6 +306,7 @@ class RemoteClientPane(ttk.Frame):
         self.job_var = tk.StringVar(value=persisted.get("remote_job_id", ""))
         self.layers_var = tk.StringVar(value=persisted.get("remote_layers", ""))
         self.nets_var = tk.StringVar(value=persisted.get("remote_nets", ""))
+        self.pid_var = tk.StringVar()  # PID reuse makes persistence unsafe.
         self.components_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="연결 정보를 입력하세요.")
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -285,7 +314,9 @@ class RemoteClientPane(ttk.Frame):
         self._cancel_requested = False
         self._job_id = ""
         self._client: Any = None
+        self._checked_pid: tuple[tuple[str, int, str, int], int] | None = None
         self._build()
+        self.pid_var.trace_add("write", self._update_pid_note)
         self.after(100, self._drain_events)
 
     def _build(self) -> None:
@@ -294,22 +325,28 @@ class RemoteClientPane(ttk.Frame):
         ttk.Label(self, text="원격 Allegro 24.1 작업", font=("Malgun Gothic", 15, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
         )
-        ttk.Label(self, text="원본 BRD가 필요하며 기존 규칙을 보존합니다. Plane 반영 중심의 결과이므로 최종 BRD 검토가 필요합니다.", foreground="#8a4b00", wraplength=720).grid(
+        ttk.Label(self, text="PID 입력시 해당 Allegro에 열린 BRD를 사용합니다. 빈칸이면 원본 BRD를 업로드합니다. Plane 반영 중심의 결과이므로 최종 BRD 검토가 필요합니다.", foreground="#8a4b00", wraplength=720).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(0, 10)
         )
         self._row(2, "워크스테이션 IP", self.host_var)
         self._row(3, "포트", self.port_var)
         self._row(4, "접속 토큰", self.token_var, show="•")
         self._row(5, "인증서 지문", self.fingerprint_var)
-        self._file_row(6, "SPD 입력", self.spd_var, self._choose_spd, "SPD 파일", "*.spd")
-        self._file_row(7, "원본 BRD", self.brd_var, self._choose_brd, "BRD 파일", "*.brd")
-        self._file_row(8, "출력 ZIP", self.output_var, self._choose_output, "ZIP 파일", "*.zip")
-        self._row(9, "기존 작업 ID", self.job_var)
-        self._row(10, "대상 레이어 (쉼표, 선택)", self.layers_var)
-        self._row(11, "대상 Net (쉼표, 선택)", self.nets_var)
-        ttk.Checkbutton(self, text="부품 위치/회전 업데이트 포함", variable=self.components_var).grid(row=12, column=1, sticky="w", pady=3)
+        ttk.Label(self, text="Allegro PID (빈칸: 새 실행)").grid(row=6, column=0, sticky="w", pady=3)
+        ttk.Entry(self, textvariable=self.pid_var).grid(row=6, column=1, sticky="ew", padx=10, pady=3)
+        self.pid_check_button = ttk.Button(self, text="PID 확인", command=self._check_pid)
+        self.pid_check_button.grid(row=6, column=2, sticky="e")
+        self.pid_note_var = tk.StringVar(value="빈칸이면 업로드한 원본 BRD로 새 Allegro 작업을 실행합니다.")
+        ttk.Label(self, textvariable=self.pid_note_var, foreground="#8a4b00", wraplength=700).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self._file_row(8, "SPD 입력", self.spd_var, self._choose_spd, "SPD 파일", "*.spd")
+        self._file_row(9, "원본 BRD", self.brd_var, self._choose_brd, "BRD 파일", "*.brd")
+        self._file_row(10, "출력 ZIP", self.output_var, self._choose_output, "ZIP 파일", "*.zip")
+        self._row(11, "기존 작업 ID", self.job_var)
+        self._row(12, "대상 레이어 (쉼표, 선택)", self.layers_var)
+        self._row(13, "대상 Net (쉼표, 선택)", self.nets_var)
+        ttk.Checkbutton(self, text="부품 위치/회전 업데이트 포함", variable=self.components_var).grid(row=14, column=1, sticky="w", pady=3)
         controls = ttk.Frame(self)
-        controls.grid(row=13, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        controls.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(10, 6))
         self.connect_button = ttk.Button(controls, text="연결 확인", command=self._connect)
         self.connect_button.grid(row=0, column=0, padx=(0, 6))
         self.run_button = ttk.Button(controls, text="전송 및 실행", command=self._run)
@@ -319,11 +356,11 @@ class RemoteClientPane(ttk.Frame):
         self.cancel_button = ttk.Button(controls, text="취소", command=self._cancel, state="disabled")
         self.cancel_button.grid(row=0, column=3, padx=(0, 10))
         ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=4, sticky="w")
-        self.rowconfigure(14, weight=1)
-        ttk.Label(self, text="원격 작업 로그").grid(row=14, column=0, columnspan=3, sticky="w")
+        self.rowconfigure(16, weight=1)
+        ttk.Label(self, text="원격 작업 로그").grid(row=16, column=0, columnspan=3, sticky="w")
         frame = ttk.Frame(self)
-        frame.grid(row=15, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
-        self.rowconfigure(15, weight=1)
+        frame.grid(row=17, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+        self.rowconfigure(17, weight=1)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         self.log = tk.Text(frame, height=12, wrap="word", state="disabled", font=("Consolas", 10))
@@ -355,6 +392,34 @@ class RemoteClientPane(ttk.Frame):
         path = filedialog.asksaveasfilename(title="결과 ZIP 저장", defaultextension=".zip", filetypes=[("ZIP 파일", "*.zip")])
         if path:
             self.output_var.set(path)
+
+    def _update_pid_note(self, *_: Any) -> None:
+        try:
+            pid = parse_allegro_pid(self.pid_var.get())
+        except ValueError:
+            self.pid_note_var.set("PID 형식을 확인하세요. 1 이상 4,294,967,295 이하의 정수만 사용할 수 있습니다.")
+        else:
+            self.pid_note_var.set("PID 입력시 해당 Allegro에 열린 BRD를 사용합니다." if pid else "빈칸이면 업로드한 원본 BRD로 새 Allegro 작업을 실행합니다.")
+
+    def _check_pid(self) -> None:
+        if self._running:
+            return
+        try:
+            host, port, token, fingerprint = self._config()
+            pid = parse_allegro_pid(self.pid_var.get())
+            if pid is None:
+                raise ValueError("확인할 Allegro PID를 입력하세요.")
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self._start_worker(self._check_pid_worker, host, port, token, fingerprint, pid)
+
+    def _check_pid_worker(self, host: str, port: int, token: str, fingerprint: str, pid: int) -> None:
+        from brd_spd.remote import RemoteClient
+
+        client = RemoteClient(host, port=port, token=token, fingerprint=fingerprint, timeout=30)
+        result = client.check_pid(pid)
+        self._events.put(("pid_validated", (pid_identity_key(host, port, fingerprint, pid), result)))
 
     def _config(self) -> tuple[str, int, str, str]:
         host = self.host_var.get().strip()
@@ -394,9 +459,15 @@ class RemoteClientPane(ttk.Frame):
             messagebox.showerror(APP_NAME, str(exc))
             return
         source_text, brd_text, output_text = self.spd_var.get().strip(), self.brd_var.get().strip(), self.output_var.get().strip()
-        source, base_brd = Path(source_text), Path(brd_text)
-        if not source.is_file() or not base_brd.is_file():
-            messagebox.showerror(APP_NAME, "SPD와 원본 BRD 파일이 모두 필요합니다.")
+        try:
+            pid = parse_allegro_pid(self.pid_var.get())
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        source = Path(source_text)
+        base_brd = Path(brd_text) if brd_text else None
+        if not source.is_file() or (pid is None and (base_brd is None or not base_brd.is_file())):
+            messagebox.showerror(APP_NAME, "SPD는 항상 필요하며, PID를 비우면 원본 BRD도 필요합니다.")
             return
         if not output_text:
             messagebox.showerror(APP_NAME, "결과 ZIP 저장 위치를 지정하세요.")
@@ -412,6 +483,12 @@ class RemoteClientPane(ttk.Frame):
             return
         self._cancel_requested = False
         options = {"layers": self._items(self.layers_var.get()), "nets": self._items(self.nets_var.get()), "update_components": self.components_var.get()}
+        if pid is not None:
+            options["allegro_pid"] = pid
+            key = pid_identity_key(host, port, fingerprint, pid)
+            prior = self._checked_pid
+            if prior is not None and prior[0] == key:
+                options["allegro_creation_time"] = prior[1]
         options = {key: value for key, value in options.items() if value is not None}
         self._start_worker(self._run_worker, host, port, token, fingerprint, source, base_brd, output, options)
 
@@ -447,13 +524,19 @@ class RemoteClientPane(ttk.Frame):
         self._events.put(("log", f"기존 작업 연결: {job_id}"))
         self._watch_job(client, job_id, output)
 
-    def _run_worker(self, host: str, port: int, token: str, fingerprint: str, source: Path, base_brd: Path, output: Path, options: dict[str, Any]) -> None:
+    def _run_worker(self, host: str, port: int, token: str, fingerprint: str, source: Path, base_brd: Path | None, output: Path, options: dict[str, Any]) -> None:
         from brd_spd.remote import RemoteClient
 
         client = RemoteClient(host, port=port, token=token, fingerprint=fingerprint, timeout=30)
         self._client = client
         self._events.put(("log", "워크스테이션 연결 확인"))
         self._events.put(("log", str(client.health())))
+        if "allegro_pid" in options and "allegro_creation_time" not in options:
+            pid = int(options["allegro_pid"])
+            identity = client.check_pid(pid)
+            options = dict(options)
+            options["allegro_creation_time"] = checked_creation_time(identity, pid)
+            self._events.put(("log", f"Allegro PID {pid}를 작업 직전에 확인했습니다."))
         job_id = ""
         try:
             job = client.create_job(options)
@@ -470,7 +553,8 @@ class RemoteClientPane(ttk.Frame):
             if self._cancel_requested:
                 raise _UserCancelled("사용자가 작업을 취소했습니다.")
             client.upload_file(job_id, "spd", source, progress=upload_progress)
-            client.upload_file(job_id, "brd", base_brd, progress=upload_progress)
+            if base_brd is not None:
+                client.upload_file(job_id, "brd", base_brd, progress=upload_progress)
             if self._cancel_requested:
                 raise _UserCancelled("사용자가 작업을 취소했습니다.")
             client.submit_job(job_id)
@@ -532,6 +616,7 @@ class RemoteClientPane(ttk.Frame):
         self.connect_button.configure(state="disabled")
         self.run_button.configure(state="disabled")
         self.resume_button.configure(state="disabled")
+        self.pid_check_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.status_var.set("작업 중…")
         def runner() -> None:
@@ -548,6 +633,14 @@ class RemoteClientPane(ttk.Frame):
                 if kind == "log": self._write_log(str(payload))
                 elif kind == "status": self.status_var.set(str(payload))
                 elif kind == "job": self.job_var.set(str(payload))
+                elif kind == "pid_validated":
+                    key, identity = payload
+                    creation = checked_creation_time(identity, key[3])
+                    self._checked_pid = (key, creation)
+                    executable = identity.get("executable", "")
+                    pid = identity.get("pid", self.pid_var.get())
+                    self._write_log(f"PID 확인됨: {pid} | {executable} | 생성: {creation}")
+                    self._finish("PID 확인됨")
                 elif kind == "connected":
                     self._client, health = payload
                     self._write_log("연결 확인: " + str(health))
@@ -580,6 +673,7 @@ class RemoteClientPane(ttk.Frame):
         self.connect_button.configure(state="normal")
         self.run_button.configure(state="normal")
         self.resume_button.configure(state="normal")
+        self.pid_check_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self.status_var.set(status)
         save_settings({"remote_host": self.host_var.get(), "remote_port": self.port_var.get(), "remote_fingerprint": self.fingerprint_var.get(), "remote_spd": self.spd_var.get(), "remote_brd": self.brd_var.get(), "remote_output": self.output_var.get(), "remote_job_id": self.job_var.get(), "remote_layers": self.layers_var.get(), "remote_nets": self.nets_var.get()})
@@ -752,7 +846,7 @@ class DesktopApp(ttk.Frame):
     def __init__(self, master: tk.Tk) -> None:
         super().__init__(master)
         master.title(APP_NAME)
-        master.minsize(760, 580)
+        master.minsize(760, 660)
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
         self.grid(sticky="nsew")

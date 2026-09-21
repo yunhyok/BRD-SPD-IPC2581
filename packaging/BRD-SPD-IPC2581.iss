@@ -1,6 +1,6 @@
-; Build with: ISCC /DMyAppVersion=0.2.0 packaging\BRD-SPD-IPC2581.iss
+; Build with: ISCC /DMyAppVersion=0.3.0 packaging\BRD-SPD-IPC2581.iss
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.0"
+  #define MyAppVersion "0.3.0"
 #endif
 
 #define MyAppName "BRD-SPD-IPC2581"

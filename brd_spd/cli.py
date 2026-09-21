@@ -40,6 +40,8 @@ def main(argv=None):
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--allegro-exe", type=Path, default=Path(r"C:\Cadence\SPB_24.1\tools\bin\allegro.exe"))
     serve.add_argument("--allow-client", action="append", dest="allowed_clients")
+    serve.add_argument("--session-timeout", type=float, default=21600,
+                       help="Maximum observation seconds for an existing PID job (default: 6 hours)")
     remote = commands.add_parser("remote", help="Control a paired workstation; host/IP can change")
     remote.add_argument("--host", default=os.environ.get("BRDSPD_HOST", "127.0.0.1"))
     remote.add_argument("--port", type=int, default=8765)
@@ -48,9 +50,13 @@ def main(argv=None):
     actions = remote.add_subparsers(dest="action", required=True)
     actions.add_parser("health")
     actions.add_parser("jobs", help="List the latest workstation jobs for reconnection")
+    check_pid = actions.add_parser("check-pid", help="Verify an existing Allegro PID on the workstation")
+    check_pid.add_argument("pid", type=int)
     submit = actions.add_parser("submit")
     submit.add_argument("source", type=Path)
-    submit.add_argument("--base-brd", type=Path, required=True)
+    target = submit.add_mutually_exclusive_group(required=True)
+    target.add_argument("--base-brd", type=Path, help="Upload BRD and launch a new batch Allegro")
+    target.add_argument("--allegro-pid", type=int, help="Use the BRD currently open in this workstation Allegro PID")
     submit.add_argument("--layer", action="append", dest="layers")
     submit.add_argument("--net", action="append", dest="nets")
     submit.add_argument("--update-components", action="store_true")
@@ -92,7 +98,8 @@ def main(argv=None):
         elif args.command == "serve":
             from .remote import AgentConfig, WorkstationAgent
             agent = WorkstationAgent(AgentConfig(datadir=args.data_dir, host=args.host,
-                port=args.port, allegro_exe=args.allegro_exe, allowed_clients=args.allowed_clients))
+                port=args.port, allegro_exe=args.allegro_exe, allowed_clients=args.allowed_clients,
+                session_timeout_seconds=args.session_timeout))
             try:
                 info = agent.start()
                 print(json.dumps({k: v for k, v in info.items() if k != "token"}, default=str, indent=2), flush=True)
@@ -115,16 +122,24 @@ def main(argv=None):
                 result = client.health()
             elif args.action == "jobs":
                 result = client.list_jobs()
+            elif args.action == "check-pid":
+                result = client.check_pid(args.pid)
             elif args.action == "submit":
                 # Fail locally before creating a remote job when either input is absent.
-                for path in (args.source, args.base_brd):
+                for path in ([args.source, args.base_brd] if args.base_brd else [args.source]):
                     if not path.is_file():
                         raise FileNotFoundError(path)
-                job = client.create_job({"layers": args.layers, "nets": args.nets,
-                                         "update_components": args.update_components})
+                options = {"layers": args.layers, "nets": args.nets,
+                           "update_components": args.update_components}
+                if args.allegro_pid is not None:
+                    identity = client.check_pid(args.allegro_pid)
+                    options["allegro_pid"] = args.allegro_pid
+                    options["allegro_creation_time"] = identity["creation_time"]
+                job = client.create_job(options)
                 try:
                     client.upload_file(job["id"], "spd", args.source, progress=lambda s: print(s, flush=True))
-                    client.upload_file(job["id"], "brd", args.base_brd, progress=lambda s: print(s, flush=True))
+                    if args.base_brd:
+                        client.upload_file(job["id"], "brd", args.base_brd, progress=lambda s: print(s, flush=True))
                     result = client.submit_job(job["id"])
                 except BaseException:
                     try:
