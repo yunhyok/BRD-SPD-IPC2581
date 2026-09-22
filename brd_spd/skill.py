@@ -29,7 +29,14 @@ class _Report:
 
 def _skill_string(value: str) -> str:
     """JSON string quoting is compatible with SKILL for these UTF-8 strings."""
-    return json.dumps(str(value), ensure_ascii=False)
+    text = str(value)
+    for character in text:
+        # SKILL does not understand the \uXXXX escapes json would emit here.
+        if ord(character) < 0x20 or ord(character) == 0x7F:
+            raise ValueError(
+                f"Control character U+{ord(character):04X} cannot be written to SKILL: {text!r}"
+            )
+    return json.dumps(text, ensure_ascii=False)
 
 
 def _num(value: float) -> str:
@@ -46,11 +53,59 @@ def _native_layer(name: str) -> str:
     return name
 
 
+_QUAD_SEGS = 32
+_TOLERANCE = 1e-9
+
+
 def _shape(encoded: str, kind: str):
+    """Return the lookup geometry and the exact source coordinates.
+
+    A circle is approximated by a *circumscribed* polygon so that the bounding
+    box used for lookup never falls inside the true disk.  Containment itself is
+    decided analytically by :func:`_contains`; emission stays an exact circle.
+    """
     data = json.loads(encoded)
     if kind == "Circle":
-        return Point(data[:2]).buffer(data[2], quad_segs=32), data
+        radius = data[2] / math.cos(math.pi / (4 * _QUAD_SEGS))
+        return Point(data[:2]).buffer(radius, quad_segs=_QUAD_SEGS), data
     return Polygon(list(zip(data[::2], data[1::2]))), data
+
+
+def _contains(geometry, circle, hole, hole_circle, hole_data) -> bool:
+    """Exact ``parent covers void`` test; circles are handled analytically."""
+    if circle is not None:
+        x, y, radius = circle
+        if hole_circle is not None:
+            return math.hypot(hole_circle[0] - x, hole_circle[1] - y) + hole_circle[2] <= radius + _TOLERANCE
+        # A disk is convex: it covers a polygon exactly when it covers every vertex.
+        return all(
+            math.hypot(px - x, py - y) <= radius + _TOLERANCE
+            for px, py in zip(hole_data[::2], hole_data[1::2])
+        )
+    if hole_circle is not None:
+        center = Point(hole_circle[:2])
+        return geometry.covers(center) and (
+            geometry.boundary.distance(center) + _TOLERANCE >= hole_circle[2]
+        )
+    # Unit conversion leaves coordinates a fraction of a nanometre apart, so the
+    # polygon test gets the same tolerance the circle tests use.
+    return geometry.covers(hole) or geometry.buffer(_TOLERANCE, quad_segs=1).covers(hole)
+
+
+def _overlaps(geometry, circle, hole, hole_circle) -> bool:
+    """True when parent and void share area rather than only a boundary."""
+    if circle is not None:
+        x, y, radius = circle
+        if hole_circle is not None:
+            return math.hypot(hole_circle[0] - x, hole_circle[1] - y) < radius + hole_circle[2] - _TOLERANCE
+        return Point(x, y).distance(hole) < radius - _TOLERANCE
+    if hole_circle is not None:
+        return geometry.distance(Point(hole_circle[:2])) < hole_circle[2] - _TOLERANCE
+    return (
+        geometry.intersects(hole)
+        and not geometry.touches(hole)
+        and geometry.buffer(-_TOLERANCE, quad_segs=1).intersects(hole)
+    )
 
 
 def _point_list(data: list[float]) -> str:
@@ -105,8 +160,50 @@ procedure(bsResult(status errorText)
 procedure(bsP(x y) list(x * bsMM y * bsMM))
 procedure(bsL(value) value * bsMM)
 
+; axlSelectByName populates the current selection set and obeys the user's Find
+; Filter, so it can clobber an interactive selection and miss existing objects.
+; Look objects up directly first and only fall back to a filtered selection.
 procedure(bsFindNet(netName)
-  car(axlSelectByName("NET" netName))
+  let((found)
+    found = axlDBFindByName('net netName)
+    if(found then
+      bsLog(sprintf(nil "Resolved net %s with axlDBFindByName" netName))
+    else
+      axlClearSelSet()
+      axlSetFindFilter(?enabled '(noall nets) ?onButtons '(nets))
+      axlSelectByName("NET" netName)
+      found = car(axlGetSelSet())
+      axlClearSelSet()
+      when(found
+        bsLog(sprintf(nil "Resolved net %s with the Find Filter selection fallback" netName))
+      )
+    )
+    found
+  )
+)
+
+procedure(bsFindComponent(refdes)
+  let((found)
+    found = axlDBFindByName('refdes refdes)
+    when(found && null(found->symbol)
+      ; A hit without a placed symbol must not suppress the fallback lookup.
+      bsLog(sprintf(nil "axlDBFindByName returned an unplaced %s; trying the Find Filter" refdes))
+      found = nil
+    )
+    if(found then
+      bsLog(sprintf(nil "Resolved component %s with axlDBFindByName" refdes))
+    else
+      axlClearSelSet()
+      axlSetFindFilter(?enabled '(noall comps) ?onButtons '(comps))
+      axlSelectByName("COMPREFDES" refdes)
+      found = car(axlGetSelSet())
+      axlClearSelSet()
+      when(found
+        bsLog(sprintf(nil "Resolved component %s with the Find Filter selection fallback" refdes))
+      )
+    )
+    found
+  )
 )
 
 procedure(bsValidate(layerName netName)
@@ -119,7 +216,8 @@ procedure(bsValidate(layerName netName)
 )
 
 procedure(bsDeletePlane(layerName netName)
-  let((shape)
+  let((shape skipped)
+    skipped = 0
     foreach(shape copy(axlDBGetShapes(strcat("BOUNDARY/" layerName)))
       when(shape->net && equal(shape->net->name netName)
         unless(axlDeleteObject(shape)
@@ -128,11 +226,20 @@ procedure(bsDeletePlane(layerName netName)
       )
     )
     foreach(shape copy(axlDBGetShapes(strcat("ETCH/" layerName)))
-      when(shape->net && equal(shape->net->name netName) && null(shape->shapeBoundary)
-        unless(axlDeleteObject(shape)
-          bsError(sprintf(nil "Could not delete static plane %s/%s" layerName netName))
+      when(shape->net && equal(shape->net->name netName)
+        ; Only independent static copper is replaced; auto-generated fill and
+        ; dynamic boundaries stay with the shape that owns them.
+        if(!shape->shapeBoundary && !shape->shapeIsBoundary && !shape->shapeAuto then
+          unless(axlDeleteObject(shape)
+            bsError(sprintf(nil "Could not delete static plane %s/%s" layerName netName))
+          )
+        else
+          skipped = skipped + 1
         )
       )
+    )
+    when(skipped > 0
+      bsLog(sprintf(nil "Skipped %d dynamic/auto-generated ETCH shapes on %s/%s" skipped layerName netName))
     )
   )
 )
@@ -183,7 +290,7 @@ procedure(bsEndPlane()
 
 procedure(bsUpdateComponent(refdes x y rotation expectedMirrored)
   let((component symbol actualMirrored dx dy da moved)
-    component = car(axlSelectByName("COMPREFDES" refdes))
+    component = bsFindComponent(refdes)
     if(null(component) || null(component->symbol) then
       bsMissingComponents = bsMissingComponents + 1
       bsLog(sprintf(nil "UNSUPPORTED missing/unplaced component: %s" refdes))
@@ -194,11 +301,20 @@ procedure(bsUpdateComponent(refdes x y rotation expectedMirrored)
       unless(equal(actualMirrored expectedMirrored)
         bsError(sprintf(nil "Component side differs from SPD: %s" refdes))
       )
+      da = rotation - symbol->rotation
+      ; Whether Allegro applies ?move before ?angle is unverified, so rotate
+      ; about the symbol's current origin first (which does not move it), then
+      ; move it from wherever it now is to the target location.
+      unless(da == 0.0
+        moved = axlTransformObject(symbol ?angle da ?origin list(xCoord(symbol->xy) yCoord(symbol->xy)) ?allOrNone t)
+        unless(moved bsError(sprintf(nil "Could not rotate component: %s" refdes)))
+      )
       dx = bsL(x) - xCoord(symbol->xy)
       dy = bsL(y) - yCoord(symbol->xy)
-      da = rotation - symbol->rotation
-      moved = axlTransformObject(symbol ?move list(dx dy) ?angle da ?allOrNone t)
-      unless(moved bsError(sprintf(nil "Could not update component: %s" refdes)))
+      unless(dx == 0.0 && dy == 0.0
+        moved = axlTransformObject(symbol ?move list(dx dy) ?allOrNone t)
+        unless(moved bsError(sprintf(nil "Could not move component: %s" refdes)))
+      )
       bsComponents = bsComponents + 1
     )
   )
@@ -206,9 +322,28 @@ procedure(bsUpdateComponent(refdes x y rotation expectedMirrored)
 '''
 
 
-_SKILL_FOOTER = r'''procedure(bsMain()
+_SKILL_FOOTER = r'''procedure(bsIsBaseDesign(name)
+  let((base)
+    base = lowerCase(name)
+    when(rindex(base "/") base = substring(rindex(base "/") 2))
+    when(rindex(base "\\") base = substring(rindex(base "\\") 2))
+    equal(base "base.brd") || equal(base "base")
+  )
+)
+
+procedure(bsMain()
   unless(isFile("base.brd") bsError("base.brd is missing"))
-  unless(axlOpenDesignForBatch("base.brd" "wf") bsError("Could not open base.brd"))
+  ; allegro -s run.scr base.brd may already have base.brd open; opening it a
+  ; second time can prompt, which would hang under -nograph.
+  if(axlCurrentDesign() then
+    if(bsIsBaseDesign(axlCurrentDesign()) then
+      bsLog("base.brd already open; skipping axlOpenDesignForBatch")
+    else
+      bsError(sprintf(nil "Another design is already open: %s" axlCurrentDesign()))
+    )
+  else
+    unless(axlOpenDesignForBatch("base.brd" "wf") bsError("Could not open base.brd"))
+  )
   bsMM = axlMKSConvert(1.0 "mm" car(axlDBGetDesignUnits()))
   unless(bsMM bsError("Could not convert millimeters to active BRD units"))
   bsLog("Opened base.brd; validating requested layers and nets")
@@ -216,6 +351,9 @@ _SKILL_FOOTER = r'''procedure(bsMain()
   bsTxn = axlDBTransactionStart()
   unless(bsTxn bsError("Could not start Allegro database transaction"))
   bsApply()
+  when(bsMissingComponents > 0
+    bsError(sprintf(nil "%d component(s) could not be updated" bsMissingComponents))
+  )
   unless(axlDBTransactionCommit(bsTxn)
     bsError("Could not commit database transaction")
   )
@@ -332,6 +470,9 @@ _SKILL_SESSION_FOOTER = r'''procedure(bsMain()
     bsTxn = axlDBTransactionStart()
     unless(bsTxn bsError("Could not start Allegro database transaction"))
     bsApply()
+    when(bsMissingComponents > 0
+      bsError(sprintf(nil "%d component(s) could not be updated" bsMissingComponents))
+    )
     bsCheckCancel()
     unless(axlDBTransactionCommit(bsTxn)
       bsError("Could not commit database transaction")
@@ -347,40 +488,42 @@ _SKILL_SESSION_FOOTER = r'''procedure(bsMain()
 )
 
 procedure(bsRun()
+  ; No return form is used here: return only unwinds an enclosing prog, so
+  ; outside one it would signal an error instead of refusing the job cleanly.
   let((result rollback)
-    unless(bsSessionPathsFree()
+    if(bsSessionPathsFree() then
+      bsTouch(bsStartedPath "started")
+      result = errset(bsMain() t)
+      if(result then
+        bsLog("SUCCESS result.brd saved; Allegro session remains open")
+        bsResult("success" "")
+      else
+        when(bsTxn
+          rollback = errset(axlDBTransactionRollback(bsTxn) t)
+          unless(rollback && car(rollback)
+            bsRollbackFailed = t
+            bsLog("ROLLBACK FAILED; design modification state is unknown; recover with session-before.brd")
+          )
+          bsTxn = nil
+        )
+        if(bsCancelled && !bsRollbackFailed then
+          bsLog("CANCELLED; active transaction rolled back when possible")
+          bsResult("cancelled" "Cancellation requested; session remains open")
+        else
+          if(bsCommitted then
+            bsLog("FAILED after commit/save; current design remains modified; recover with session-before.brd")
+          else
+            bsLog("FAILED before commit; active transaction rolled back when possible; keep session-before.brd for recovery")
+          )
+          bsResult("failed" "SKILL execution failed; see execution.log and session-before.brd")
+        )
+      )
+      bsTouch(bsFinishedPath "finished")
+      bsSessionBusy = nil
+    else
       printf("BRD-SPD session job refused: one or more output paths already exist.\n")
       bsSessionBusy = nil
-      return(nil)
     )
-    bsTouch(bsStartedPath "started")
-    result = errset(bsMain() t)
-    if(result then
-      bsLog("SUCCESS result.brd saved; Allegro session remains open")
-      bsResult("success" "")
-    else
-      when(bsTxn
-        rollback = errset(axlDBTransactionRollback(bsTxn) t)
-        unless(rollback && car(rollback)
-          bsRollbackFailed = t
-          bsLog("ROLLBACK FAILED; design modification state is unknown; recover with session-before.brd")
-        )
-        bsTxn = nil
-      )
-      if(bsCancelled && !bsRollbackFailed then
-        bsLog("CANCELLED; active transaction rolled back when possible")
-        bsResult("cancelled" "Cancellation requested; session remains open")
-      else
-        if(bsCommitted then
-          bsLog("FAILED after commit/save; current design remains modified; recover with session-before.brd")
-        else
-          bsLog("FAILED before commit; active transaction rolled back when possible; keep session-before.brd for recovery")
-        )
-        bsResult("failed" "SKILL execution failed; see execution.log and session-before.brd")
-      )
-    )
-    bsTouch(bsFinishedPath "finished")
-    bsSessionBusy = nil
   )
 )
 
@@ -477,61 +620,132 @@ def _selected_layer(requested: set[str] | None, original: str, native: str) -> b
     return requested is None or original.casefold() in requested or native.casefold() in requested
 
 
-def _associate_voids(db, section: str, selected_nets: set[str] | None, report: _Report):
-    db.execute("CREATE TEMP TABLE IF NOT EXISTS native_holes(parent INTEGER, child INTEGER)")
-    db.execute("DELETE FROM native_holes")
-    positives, geometries, nets, valid = [], [], [], []
-    for rowid, net, kind, encoded in db.execute(
-        "SELECT rowid,net,kind,data FROM shapes WHERE section=? AND polarity='+'", (section,)
-    ):
-        if not net or (selected_nets is not None and net.casefold() not in selected_nets):
-            continue
-        geometry, _ = _shape(encoded, kind)
-        ok = geometry.is_valid and not geometry.is_empty
-        if not ok:
+def _selected_positives(db, section: str, selected_nets: set[str] | None) -> list[tuple]:
+    return [
+        row
+        for row in db.execute(
+            "SELECT rowid,net,kind,data FROM shapes WHERE section=? AND polarity='+'", (section,)
+        )
+        if row[1] and (selected_nets is None or row[1].casefold() in selected_nets)
+    ]
+
+
+def _associate_voids(
+    db, section: str, selected_nets: set[str] | None, report: _Report, associated: set | None = None
+):
+    """Attach every negative record to the positives it removes copper from.
+
+    Negatives are never filtered by net before the search: a netless void may
+    belong to any emitted positive, a void with a net only to a positive on the
+    same net.  A void that no selected positive contains is dropped, and counted,
+    only when its own net is not part of the selection; a negative on net A can
+    never remove copper from net B, so foreign copper around it proves nothing.
+    """
+    db.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS native_holes(section TEXT, parent INTEGER, child INTEGER)"
+    )
+    if associated is not None and section in associated:
+        # The same section can be patched onto several layers.  Associate it
+        # once so the SPD record counts are not multiplied by the layer count.
+        return [row[0] for row in _selected_positives(db, section, selected_nets)]
+    db.execute("DELETE FROM native_holes WHERE section=?", (section,))
+    positives, geometries, circles, nets = [], [], [], []
+    for rowid, net, kind, encoded in _selected_positives(db, section, selected_nets):
+        geometry, data = _shape(encoded, kind)
+        if not geometry.is_valid or geometry.is_empty:
             raise ValueError(f"Invalid positive plane geometry in {section!r}, shape row {rowid}")
         prepare(geometry)
         positives.append(rowid)
         geometries.append(geometry)
+        circles.append(data if kind == "Circle" else None)
         nets.append(net)
-        valid.append(ok)
     tree = STRtree(geometries) if geometries else None
     for rowid, net, kind, encoded, line in db.execute(
         "SELECT rowid,net,kind,data,line FROM shapes WHERE section=? AND polarity='-'", (section,)
     ):
-        if not net or (selected_nets is not None and net.casefold() not in selected_nets):
-            continue
         hole, data = _shape(encoded, kind)
         if not hole.is_valid or hole.is_empty:
             raise ValueError(f"Invalid plane void geometry in {section!r}, shape row {rowid}")
-        parents = []
+        hole_circle = data if kind == "Circle" else None
+        parents, parent_nets, crossing = [], [], []
         if tree is not None:
             for index in tree.query(hole):
-                if nets[index] != net or not valid[index]:
+                if net and nets[index] != net:
                     continue
-                outer = geometries[index]
-                if kind == "Circle":
-                    center = Point(data[:2])
-                    contained = outer.covers(center) and outer.boundary.distance(center) + 1e-9 >= data[2]
-                else:
-                    contained = outer.covers(hole)
-                if contained:
+                if _contains(geometries[index], circles[index], hole, hole_circle, data):
                     parents.append(positives[index])
-        preceding = [parent for parent in parents if parent < rowid]
-        parent = max(preceding) if preceding else (parents[0] if len(parents) == 1 else None)
-        if parent is None:
+                    parent_nets.append(nets[index])
+                elif _overlaps(geometries[index], circles[index], hole, hole_circle):
+                    crossing.append(positives[index])
+        if crossing:
+            rows = ", ".join(str(row) for row in sorted(set(parents + crossing)))
+            if parents or len(crossing) > 1:
+                raise ValueError(
+                    f"line {line}: plane void in {section!r}, shape row {rowid} on net {net!r}: "
+                    f"void spans several overlapping same-net positive shapes (rows {rows}) "
+                    f"without being inside one of them; split the void or merge the shapes in the SPD"
+                )
+            raise ValueError(
+                f"line {line}: plane void in {section!r}, shape row {rowid} on net {net!r} "
+                f"overlaps positive shape row {crossing[0]} without being contained in it"
+            )
+        if not parents:
+            if not net or (selected_nets is not None and net.casefold() not in selected_nets):
+                report.warn(
+                    "NATIVE_VOID_OUTSIDE_SELECTION",
+                    f"{section!r}, shape row {rowid}: void on net {net!r} has no containing "
+                    f"positive shape in the selection and is not emitted",
+                    line,
+                )
+                report.counts["native_voids_outside_selection"] += 1
+                continue
             raise ValueError(
                 f"line {line}: plane void in {section!r}, shape row {rowid} has no unique "
                 f"positive parent on net {net!r}"
             )
-        db.execute("INSERT INTO native_holes VALUES (?,?)", (parent, rowid))
+        if len(set(parent_nets)) > 1:
+            # Different nets sharing copper on one layer is a short, not a void.
+            pairs = ", ".join(
+                f"row {parent} ({parent_net})"
+                for parent, parent_net in sorted(zip(parents, parent_nets))
+            )
+            raise ValueError(
+                f"line {line}: plane void in {section!r}, shape row {rowid} is contained in "
+                f"positive shapes of different nets ({pairs}); overlapping copper of different "
+                f"nets on one layer cannot be voided safely"
+            )
+        if len(parents) > 1:
+            # SPD removes copper from every same-net positive it overlaps.
+            report.warn(
+                "NATIVE_VOID_MULTIPLE_PARENTS",
+                f"{section!r}, shape row {rowid}: void is contained in {len(parents)} positive "
+                f"shapes and is emitted into each of them",
+                line,
+            )
+            report.counts["native_voids_multiple_parents"] += 1
+        if any(parent > rowid for parent in parents):
+            report.warn(
+                "NATIVE_VOID_ORDER_FALLBACK",
+                f"{section!r}, shape row {rowid}: a containing positive shape occurs later in the file",
+                line,
+            )
+            report.counts["native_voids_before_parent"] += 1
+        db.executemany(
+            "INSERT INTO native_holes VALUES (?,?,?)",
+            [(section, parent, rowid) for parent in parents],
+        )
         report.counts["native_voids"] += 1
+        report.counts["native_void_emissions"] += len(parents)
     db.execute("CREATE INDEX IF NOT EXISTS native_holes_parent ON native_holes(parent)")
+    if associated is not None:
+        associated.add(section)
     return positives
 
 
-def _write_plane_calls(handle, db, section, layer, selected_nets, report, *, session_mode=False):
-    positives = _associate_voids(db, section, selected_nets, report)
+def _write_plane_calls(
+    handle, db, section, layer, selected_nets, report, *, session_mode=False, associated=None
+):
+    positives = _associate_voids(db, section, selected_nets, report, associated)
     for rowid in positives:
         if session_mode:
             handle.write("    bsCheckCancel()\n")
@@ -638,6 +852,16 @@ def generate_bundle(
             conductor_order = [
                 layer["name"] for layer in metadata["layers"] if layer["kind"] == "CONDUCTOR"
             ]
+            # Two stackup layers that become the same ETCH layer would silently
+            # be merged into one native layer, as the IPC path already refuses.
+            native_names: dict[str, str] = {}
+            for original in conductor_order:
+                native = _native_layer(original)
+                if native_names.setdefault(native, original) != original:
+                    raise ValueError(
+                        "Layer names collide after removing Signal$/Plane$ prefixes: "
+                        f"{native_names[native]!r} and {original!r} both map to ETCH/{native}"
+                    )
             sections = []
             found_layers, found_nets, pairs = set(), set(), set()
             mapped_sections = set(metadata["shape_layers"])
@@ -650,40 +874,43 @@ def generate_bundle(
                         f"Shape section {section!r} has no Patch... Layer mapping; {count} records are not emitted",
                     )
                     report.counts["unsupported_unmapped_shapes"] += count
-            for section, original in metadata["shape_layers"].items():
-                if original not in conductor_layers:
-                    shape_count = db.execute(
-                        "SELECT COUNT(*) FROM shapes WHERE section=?", (section,)
+            for section, section_layers in metadata["shape_layers"].items():
+                # One .Shape section can be patched onto several layers; every
+                # patched layer gets its own pair and its own shape emission.
+                for original in section_layers:
+                    if original not in conductor_layers:
+                        shape_count = db.execute(
+                            "SELECT COUNT(*) FROM shapes WHERE section=?", (section,)
+                        ).fetchone()[0]
+                        if shape_count:
+                            report.warn(
+                                "NATIVE_NONCONDUCTOR_SHAPES_NOT_EMITTED",
+                                f"{section!r} maps to non-conductor layer {original!r}; {shape_count} records are not emitted",
+                            )
+                            report.counts["unsupported_nonconductor_shapes"] += shape_count
+                        continue
+                    native = _native_layer(original)
+                    if not _selected_layer(requested_layers, original, native):
+                        continue
+                    no_net_count = db.execute(
+                        "SELECT COUNT(*) FROM shapes WHERE section=? AND polarity='+' AND net=''", (section,)
                     ).fetchone()[0]
-                    if shape_count:
-                        report.warn(
-                            "NATIVE_NONCONDUCTOR_SHAPES_NOT_EMITTED",
-                            f"{section!r} maps to non-conductor layer {original!r}; {shape_count} records are not emitted",
+                    if no_net_count:
+                        raise ValueError(
+                            f"Native plane section {section!r} contains {no_net_count} positive shapes without a net"
                         )
-                        report.counts["unsupported_nonconductor_shapes"] += shape_count
-                    continue
-                native = _native_layer(original)
-                if not _selected_layer(requested_layers, original, native):
-                    continue
-                no_net_count = db.execute(
-                    "SELECT COUNT(*) FROM shapes WHERE section=? AND polarity='+' AND net=''", (section,)
-                ).fetchone()[0]
-                if no_net_count:
-                    raise ValueError(
-                        f"Native plane section {section!r} contains {no_net_count} positive shapes without a net"
-                    )
-                positive_nets = {
-                    row[0] for row in db.execute(
-                        "SELECT DISTINCT net FROM shapes WHERE section=? AND polarity='+' AND net!=''", (section,)
-                    )
-                    if requested_nets is None or row[0].casefold() in requested_nets
-                }
-                if positive_nets:
-                    found_layers.update((original.casefold(), native.casefold()))
-                    sections.append((section, original, native))
-                    for net in positive_nets:
-                        pairs.add((native, net))
-                        found_nets.add(net.casefold())
+                    positive_nets = {
+                        row[0] for row in db.execute(
+                            "SELECT DISTINCT net FROM shapes WHERE section=? AND polarity='+' AND net!=''", (section,)
+                        )
+                        if requested_nets is None or row[0].casefold() in requested_nets
+                    }
+                    if positive_nets:
+                        found_layers.update((original.casefold(), native.casefold()))
+                        sections.append((section, original, native))
+                        for net in positive_nets:
+                            pairs.add((native, net))
+                            found_nets.add(net.casefold())
             missing_layers = sorted(requested_layers - found_layers) if requested_layers is not None else []
             missing_nets = sorted(requested_nets - found_nets) if requested_nets is not None else []
             if missing_layers or missing_nets or not pairs:
@@ -755,6 +982,7 @@ def generate_bundle(
                     if session_mode:
                         skill.write("    bsCheckCancel()\n")
                     skill.write(f"    bsDeletePlane({_skill_string(layer)} {_skill_string(net)})\n")
+                associated: set[str] = set()
                 for index, (section, _original, native) in enumerate(sections, 1):
                     if progress:
                         progress(f"Native bundle: plane section {index}/{len(sections)}")
@@ -766,6 +994,7 @@ def generate_bundle(
                         requested_nets,
                         report,
                         session_mode=session_mode,
+                        associated=associated,
                     )
                 if update_components:
                     if len(conductor_order) < 2:

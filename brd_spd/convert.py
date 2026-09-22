@@ -226,11 +226,12 @@ def _write_design(db, metadata, reference, target, work, report, progress):
                 raise ValueError(f"Undefined output layer {layer}")
             streams[layer].write(_serialize(node))
 
-        for section, layer in metadata["shape_layers"].items():
-            if layer not in names:
-                raise ValueError(f"Shape section {section} maps to unknown layer {layer}")
-            progress(f"Plane contours: {names[layer]}")
-            write_planes(db, section, lambda node: write(names[layer], node), report, scale)
+        for section, section_layers in metadata["shape_layers"].items():
+            for layer in section_layers:
+                if layer not in names:
+                    raise ValueError(f"Shape section {section} maps to unknown layer {layer}")
+                progress(f"Plane contours: {names[layer]}")
+                write_planes(db, section, lambda node, layer=layer: write(names[layer], node), report, scale)
         unmapped = db.execute("SELECT DISTINCT section FROM shapes").fetchall()
         for (section,) in unmapped:
             if section not in metadata["shape_layers"]:

@@ -112,6 +112,9 @@ def _logical_records(source: Path, progress=None) -> Iterator[tuple[int, str]]:
                     f"line {line_number}: SPD is not valid UTF-8 "
                     f"(byte offset {exc.start} within the line)"
                 ) from exc
+            if line_number == 1 and text.startswith("﻿"):
+                # utf-8-sig semantics: a BOM must not hide the first record.
+                text = text[1:]
             if text.lstrip().startswith("+") and current is not None:
                 continuation = text.lstrip()[1:].strip()
                 current += " " + continuation
@@ -188,8 +191,26 @@ def _parse_shape(
         _warn(report, "SPD_UNSUPPORTED_SHAPE_RECORD", f"Unsupported shape record: {record[:180]}", line)
         return None
     kind, identifier, net, polarity = identity
-    numeric_tokens = [m.group(0) for m in _LENGTH_TOKEN_RE.finditer(" ".join(tokens[1:]))]
-    values = [_length(token, line, f"{kind} coordinate") for token in numeric_tokens]
+    # Trailing ``Key = value`` attributes are not geometry; split them off the
+    # way the .PadStackDef path does before harvesting coordinates.
+    assignment = _ASSIGN_RE.search(record)
+    geometry = record[: assignment.start()] if assignment else record
+    body = geometry.lstrip()[len(tokens[0]) :]
+    values = []
+    position = 0
+    for match in _LENGTH_TOKEN_RE.finditer(body):
+        leftover = body[position : match.start()].strip(" \t,()")
+        if leftover:
+            raise ValueError(
+                f"line {line}: unexpected token {leftover!r} in {kind} record: {record[:180]}"
+            )
+        values.append(_length(match.group(0), line, f"{kind} coordinate"))
+        position = match.end()
+    trailing = body[position:].strip(" \t,()")
+    if trailing:
+        raise ValueError(
+            f"line {line}: unexpected token {trailing!r} in {kind} record: {record[:180]}"
+        )
     if kind == "Polygon":
         if len(values) < 6 or len(values) % 2:
             raise ValueError(f"line {line}: polygon {identifier!r} needs coordinate pairs")
@@ -325,6 +346,8 @@ def parse_spd(source: Path, db_path: Path, report, progress=None) -> dict:
     component_parts: dict[str, str] = {}
     connection_refs: set[str] = set()
     via_padstacks: set[str] = set()
+    net_inventory: set[str] = set()
+    signed_shape_nets: dict[str, tuple[int, str]] = {}
 
     connection = sqlite3.connect(db_path)
     try:
@@ -363,6 +386,20 @@ def parse_spd(source: Path, db_path: Path, report, progress=None) -> dict:
                 if row is not None:
                     buffers["shapes"].append(row)
                     local_counts["shapes"] += 1
+                    # A trailing +/- is read as polarity, so a net whose own name
+                    # ends in a sign is indistinguishable from it.  Record both
+                    # cases: polarity that had to be assumed, and every net that
+                    # only exists after stripping a sign.
+                    if not record.split(None, 1)[0].endswith(("+", "-")):
+                        local_counts["shape_polarity_assumed"] += 1
+                        _warn(
+                            report,
+                            "SHAPE_POLARITY_ASSUMED",
+                            f"Shape record has no +/- polarity and is treated as positive: {record[:180]}",
+                            line_number,
+                        )
+                    elif row[2]:
+                        signed_shape_nets.setdefault(row[2], (line_number, record[:180]))
                 if len(buffers["shapes"]) >= _BATCH_SIZE:
                     _flush(connection, "shapes", buffers["shapes"])
                 continue
@@ -436,7 +473,11 @@ def parse_spd(source: Path, db_path: Path, report, progress=None) -> dict:
                 attrs = _assignments(record)
                 shape_name = attrs["shape"].split()[0]
                 layer_name = attrs["layer"].split()[0]
-                metadata["shape_layers"][shape_name] = layer_name
+                # One .Shape section can be patched onto several layers; keep
+                # every target layer in source order instead of the last one.
+                patched = metadata["shape_layers"].setdefault(shape_name, [])
+                if layer_name not in patched:
+                    patched.append(layer_name)
                 continue
 
             # Descriptive ``* ... description lines`` comments are conventional,
@@ -474,6 +515,7 @@ def parse_spd(source: Path, db_path: Path, report, progress=None) -> dict:
                 except (KeyError, IndexError) as exc:
                     raise ValueError(f"line {line_number}: incomplete node {identifier!r}") from exc
                 rotation = _number(attrs["absoluterotation"].split()[0], line_number, "node rotation") if "absoluterotation" in attrs else None
+                net_inventory.add(_net_from_name(identifier))
                 buffers["nodes"].append((
                     identifier,
                     _net_from_name(identifier),
@@ -506,6 +548,7 @@ def parse_spd(source: Path, db_path: Path, report, progress=None) -> dict:
                         extra[key] = value
                 if re.search(r"\b(arc|radius|center|sweepangle)\b", record, re.IGNORECASE):
                     _warn(report, "SPD_TRACE_ARC_PRESERVED", f"Arc-like trace attributes preserved in JSON for {identifier}", line_number)
+                net_inventory.add(_net_from_name(identifier))
                 buffers["traces"].append((identifier, _net_from_name(identifier), start, end, width, json.dumps(extra, separators=(",", ":"))))
                 local_counts["traces"] += 1
                 if len(buffers["traces"]) >= _BATCH_SIZE:
@@ -525,6 +568,7 @@ def parse_spd(source: Path, db_path: Path, report, progress=None) -> dict:
                 padstack = _first_attr(attrs, "padstack")
                 if padstack:
                     via_padstacks.add(padstack)
+                net_inventory.add(_net_from_name(identifier))
                 buffers["vias"].append((identifier, _net_from_name(identifier), upper, lower, padstack))
                 local_counts["vias"] += 1
                 if len(buffers["vias"]) >= _BATCH_SIZE:
@@ -612,6 +656,15 @@ def parse_spd(source: Path, db_path: Path, report, progress=None) -> dict:
             raise ValueError(f"unterminated .PadDef {pad_layer!r} section at end of file")
         if padstack_name is not None:
             raise ValueError(f"unterminated .PadStackDef {padstack_name!r} section at end of file")
+        net_inventory.discard("")
+        for net_name, (net_line, net_record) in signed_shape_nets.items():
+            for sign in ("+", "-"):
+                if net_name not in net_inventory and net_name + sign in net_inventory:
+                    raise ValueError(
+                        f"line {net_line}: ambiguous shape polarity: net {net_name + sign!r} exists "
+                        f"in this SPD, so the trailing {sign!r} of {net_record!r} cannot be "
+                        f"distinguished from a polarity sign"
+                    )
         for table, rows in buffers.items():
             _flush(connection, table, rows)
         _resolve_missing_node_references(connection, report)
