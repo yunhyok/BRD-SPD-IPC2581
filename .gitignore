@@ -15,7 +15,6 @@ local-test/
 !tests/fixtures/*.xml
 *.egg-info/
 *.spec
-schemas/IPC-2581B.xsd
 .pytest_cache/
 build-final*.err
 build-*.err
