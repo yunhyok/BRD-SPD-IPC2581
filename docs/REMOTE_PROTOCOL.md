@@ -90,7 +90,12 @@ created -> queued -> running -> succeeded
                     |       -> failed
                     |       -> cancelled
                     `restart-> interrupted
+
+running -> cancel_requested -> cancelled
+                           `-> succeeded
 ```
+
+취소 요청은 `cancel_requested`로 먼저 기록합니다. `created`나 `queued` 작업은 곧바로 `cancelled`가 되고, 실행 중인 작업은 취소를 확인한 뒤 `cancelled`로, 이미 저장을 마친 너무 늦은 취소는 `succeeded`, `cancellation_too_late=true`로 남습니다.
 
 Agent는 동시에 하나의 native 작업만 실행합니다. 실행 중 Agent가 재시작되면 새 프로세스로 시작한 `running` 또는 `cancel_requested` 작업은 `interrupted`로 바꿉니다. 이미 명령을 전달한 PID 작업은 결과 표식 관찰을 재개하며 명령을 다시 보내지 않습니다. `queued` 작업은 다시 큐에 넣습니다.
 
