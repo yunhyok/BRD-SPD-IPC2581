@@ -1,4 +1,5 @@
 import gc
+import re
 import threading
 import time
 import tkinter as tk
@@ -286,6 +287,22 @@ def test_select_all_scopes_to_filtered_view_and_clear_clears_everything(
     assert str(picker.apply_button["state"]) == "disabled"
 
 
+def _fire_binding(widget, sequence):
+    """Invoke the Python handler bound to ``sequence`` on ``widget``.
+
+    Synthesized key and double-click events only reach a window that owns
+    the keyboard focus, which a headless Windows runner never grants, so the
+    registered handler is invoked through the same Tcl command Tk would call.
+    """
+    script = widget.bind(sequence)
+    assert script, f"{sequence} is not bound on {widget}"
+    command = re.search(r"\[(\S+)\s", script).group(1)
+    substitutions = ["??"] * 19
+    substitutions[0] = "0"  # %# serial must be an integer
+    substitutions[14] = str(widget)  # %W
+    widget.tk.call(command, *substitutions)
+
+
 def test_return_applies_escape_closes_and_double_click_applies(
         tk_root, tmp_path, monkeypatch):
     source = tmp_path / "keys.spd"
@@ -299,12 +316,7 @@ def test_return_applies_escape_closes_and_double_click_applies(
         tk_root, source, "layers", None, None, applied.append
     )
     _pump(tk_root, lambda: picker._loaded)
-    # Key events only reach bindings once the window is actually mapped
-    # and focused, so make it so before generating them (Xvfb headless).
-    picker.deiconify()
-    picker.focus_force()
-    tk_root.update()
-    picker.event_generate("<Return>")
+    _fire_binding(picker, "<Return>")
     tk_root.update()
     assert applied == [CATALOG["layers"]]
     assert picker._closed
@@ -314,10 +326,7 @@ def test_return_applies_escape_closes_and_double_click_applies(
         tk_root, source, "layers", None, None, applied_escape.append
     )
     _pump(tk_root, lambda: picker2._loaded)
-    picker2.deiconify()
-    picker2.focus_force()
-    tk_root.update()
-    picker2.event_generate("<Escape>")
+    _fire_binding(picker2, "<Escape>")
     tk_root.update()
     assert picker2._closed
     assert applied_escape == []
@@ -327,16 +336,9 @@ def test_return_applies_escape_closes_and_double_click_applies(
         tk_root, source, "layers", [], None, applied_double_click.append
     )
     _pump(tk_root, lambda: picker3._loaded)
-    picker3.deiconify()
-    picker3.focus_force()
-    tk_root.update()
     picker3.listbox.selection_set(0)
     picker3._selection_changed()
-    # Tk detects a double click from two quick <Button-1> presses; it
-    # rejects a directly synthesized "<Double-Button-1>" event sequence.
-    picker3.listbox.event_generate("<Button-1>")
-    picker3.listbox.event_generate("<ButtonRelease-1>")
-    picker3.listbox.event_generate("<Button-1>")
+    _fire_binding(picker3.listbox, "<Double-Button-1>")
     tk_root.update()
     assert applied_double_click == [[CATALOG["layers"][0]]]
     assert picker3._closed
