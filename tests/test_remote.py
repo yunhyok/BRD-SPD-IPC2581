@@ -1,6 +1,9 @@
 import json
+import os
+import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -294,3 +297,137 @@ def test_submit_cannot_race_active_reupload(tmp_path):
     thread.join(5)
     assert errors and "changed state" in str(errors[0])
     assert not (tmp_path / "agent" / "jobs" / job["id"] / "input.spd.upload").exists()
+
+
+def _local_agent(tmp_path, agent_type=FakeAgent):
+    """Agent without the HTTPS server, for deterministic runner-state tests."""
+    return agent_type(AgentConfig(tmp_path / "agent", host="127.0.0.1", port=0))
+
+
+def _upload_inputs(agent, job_id):
+    agent.upload(job_id, "spd", BytesIO(b"spd-data"), len(b"spd-data"))
+    agent.upload(job_id, "brd", BytesIO(b"base-board"), len(b"base-board"))
+
+
+def test_cancel_while_queued_is_not_resurrected_into_running(tmp_path):
+    generated = []
+
+    class ObservingAgent(FakeAgent):
+        def _generate_bundle(self, source, bundle, options):
+            generated.append(self._state(bundle.parent.name)["status"])
+            return super()._generate_bundle(source, bundle, options)
+
+    agent = _local_agent(tmp_path, ObservingAgent)
+    job = agent.create_job({})
+    _upload_inputs(agent, job["id"])
+    assert agent.submit(job["id"])["status"] == "queued"
+    assert agent.cancel(job["id"])["status"] == "cancelled"
+    # The runner still holds the queue entry handed over before the cancel;
+    # a published terminal state must not be reopened as "running".
+    agent._run(job["id"])
+    assert generated == []
+    assert agent.get_job(job["id"])["status"] == "cancelled"
+    with zipfile.ZipFile(agent.result_path(job["id"])) as archive:
+        assert "agent-runner.log" in archive.namelist()
+        assert "result.brd" not in archive.namelist()
+
+
+def test_non_ascii_authorization_header_is_answered_with_json_401(tmp_path):
+    agent, _client, info = _start(tmp_path)
+    try:
+        hostile = RemoteClient("127.0.0.1", info["port"], "tökén", info["fingerprint"], timeout=5)
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            hostile.health()
+        # The connection stays usable for a correct client afterwards.
+        assert RemoteClient("127.0.0.1", info["port"], info["token"],
+                            info["fingerprint"], timeout=5).health()["status"] == "ok"
+    finally:
+        agent.stop()
+
+
+def test_failed_archive_build_leaves_no_temporary_file(tmp_path):
+    agent = _local_agent(tmp_path)
+    job = agent.create_job({})
+    directory = agent._job_dir(job["id"])
+    with pytest.raises(TypeError):
+        agent._make_result_archive(directory, directory / "bundle", include_board=False,
+                                   job_state={"status": "failed", "error": object()})
+    assert list(directory.glob("result.zip*")) == []
+
+
+def test_stop_survives_a_removed_job_directory(tmp_path):
+    agent, _client, _info = _start(tmp_path)
+    job = agent.create_job({})
+    agent._cancel[job["id"]] = threading.Event()
+    shutil.rmtree(agent._job_dir(job["id"]))
+    agent.stop()
+    restarted = agent.start()
+    try:
+        assert restarted["port"] > 0
+    finally:
+        agent.stop()
+
+
+def test_stop_releases_the_agent_when_the_runner_does_not_join(tmp_path):
+    class StuckThread:
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return True
+
+    agent, _client, _info = _start(tmp_path)
+    agent._worker_thread = StuckThread()
+    with pytest.warns(RuntimeWarning, match="cooperative cancellation"):
+        agent.stop()
+    assert agent._started is False
+    restarted = agent.start()
+    try:
+        assert restarted["port"] > 0
+    finally:
+        agent.stop()
+
+
+def test_secrets_are_created_with_owner_only_permissions(tmp_path):
+    _local_agent(tmp_path)
+    datadir = tmp_path / "agent"
+    assert (datadir / "token.txt").is_file()
+    if os.name != "nt":
+        assert stat.S_IMODE((datadir / "token.txt").stat().st_mode) == 0o600
+        assert stat.S_IMODE((datadir / "agent-key.pem").stat().st_mode) == 0o600
+
+
+def test_running_job_ids_reports_only_non_terminal_jobs(tmp_path):
+    agent = _local_agent(tmp_path)
+    job = agent.create_job({})
+    _upload_inputs(agent, job["id"])
+    assert agent.running_job_ids == []
+    agent.submit(job["id"])
+    assert agent.running_job_ids == [job["id"]]
+    agent.cancel(job["id"])
+    assert agent.running_job_ids == []
+
+
+def test_fingerprint_is_normalized_once_and_validated(tmp_path):
+    agent, _client, info = _start(tmp_path)
+    try:
+        formatted = ":".join(info["fingerprint"][i:i + 2] for i in range(0, 64, 2)).upper()
+        pinned = RemoteClient("127.0.0.1", info["port"], info["token"],
+                              f"  {formatted}  ", timeout=5)
+        assert pinned.fingerprint == info["fingerprint"]
+        assert pinned.health()["status"] == "ok"
+        for value in (":", "00" * 31, "zz" * 32, info["fingerprint"] + "0"):
+            with pytest.raises(ValueError, match="64 hex characters"):
+                RemoteClient("127.0.0.1", info["port"], info["token"], value)
+    finally:
+        agent.stop()
+
+
+def test_cli_turns_an_invalid_fingerprint_into_an_error_exit(tmp_path, capsys):
+    from brd_spd.cli import main
+
+    token_file = tmp_path / "pairing-token.txt"
+    token_file.write_text("x" * 40, encoding="ascii")
+    assert main(["remote", "--host", "192.0.2.16", "--token-file", str(token_file),
+                 "--fingerprint", ":", "health"]) == 1
+    assert "64 hex characters" in capsys.readouterr().err

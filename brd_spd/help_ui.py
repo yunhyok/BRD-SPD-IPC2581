@@ -7,16 +7,16 @@ from urllib.parse import urldefrag
 
 
 HELP_TOPICS = (
-    ("사용 안내", "overview"),
+    ("시작하기", "overview"),
     ("작업 방식 선택", "choose-workflow"),
-    ("Native SKILL 생성", "native-skill"),
     ("대상 레이어·NET 선택", "target-selection"),
-    ("워크스테이션 Agent 설정", "workstation"),
+    ("Native SKILL 생성과 수동 실행", "native-skill"),
+    ("워크스테이션 역할과 Agent 시작", "workstation"),
     ("원격 작업: 새 Allegro 실행", "remote-new"),
-    ("원격 작업: 기존 PID 지정", "remote-pid"),
-    ("결과·로그 확인", "results"),
+    ("원격 작업: 기존 Allegro PID", "remote-pid"),
+    ("결과와 다시 받기", "results"),
     ("문제 해결", "troubleshooting"),
-    ("지원 범위", "limitations"),
+    ("지원 범위와 제한", "limitations"),
 )
 
 

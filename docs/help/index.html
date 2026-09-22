@@ -99,11 +99,11 @@
         <p><strong>연결 확인</strong>, <strong>PID 확인</strong>, <strong>기존 작업 받기</strong>와 도움말은 SPD를 불러오기 전에도 사용할 수 있습니다.</p>
         <ol class="steps">
           <li>목록 창은 이미 읽은 SPD의 <strong>미리 읽은 목록</strong>을 사용합니다. 파일을 바꾸면 목록은 다시 읽으며, 같은 파일도 수정 시간이 바뀌면 이전 목록을 사용하지 않습니다.</li>
-          <li>레이어 창에서 Ctrl 또는 Shift를 사용해 여러 항목을 선택합니다. <strong>전체 선택</strong>, <strong>선택 해제</strong>, <strong>적용</strong>, <strong>닫기</strong>를 사용할 수 있습니다. 선택 창이 열린 동안에는 현재 탭의 범위와 실행을 바꿀 수 없습니다.</li>
+          <li>레이어 창에서 Ctrl 또는 Shift를 사용해 여러 항목을 선택합니다. <strong>검색</strong>란에 글자를 입력하면 목록이 좁혀지며, 숨겨진 항목의 선택은 유지됩니다. <strong>전체 선택</strong>은 현재 보이는 항목만 선택하고 <strong>선택 해제</strong>는 모든 선택을 지웁니다. <strong>적용</strong>, <strong>닫기</strong> 대신 Enter, Esc, 항목 두 번 클릭을 사용할 수 있습니다. 선택 창이 열린 동안에는 현재 탭의 범위와 실행을 바꿀 수 없습니다.</li>
           <li>레이어를 적용한 뒤 NET을 선택하려면 <strong>목록에서 선택…</strong>을 다시 엽니다. NET 목록은 현재 선택한 레이어에 있는 <strong>지원되는 plane</strong>의 NET만 보여 줍니다.</li>
           <li>NET도 Ctrl 또는 Shift로 여럿 선택하고 <strong>적용</strong>합니다. 선택 없이 적용할 수는 없습니다. 입력칸을 빈칸으로 만드는 전체 대상 의미와 혼동하지 않도록 한 동작입니다.</li>
         </ol>
-        <div class="callout"><strong>목록에 보이지 않는 항목:</strong> trace/via만 있는 NET, dielectric, 지원되는 plane이 없는 레이어는 native plane 갱신 대상이 아니므로 목록에 나타나지 않습니다. 입력칸을 비워 두면 현재 SPD에서 지원되는 plane 전체가 대상입니다. <strong>전체 선택</strong>은 그 목록의 모든 항목을 입력칸에 넣습니다.</div>
+        <div class="callout"><strong>목록에 보이지 않는 항목:</strong> trace/via만 있는 NET, dielectric, 지원되는 plane이 없는 레이어는 native plane 갱신 대상이 아니므로 목록에 나타나지 않습니다. 입력칸을 비워 두면 현재 SPD에서 지원되는 plane 전체가 대상입니다. <strong>전체 선택</strong>은 검색으로 보이는 목록의 항목을 입력칸에 넣습니다. 같은 SPD를 다시 불러오면 이전 선택을 복원하고, 이번 SPD에 없는 이름만 제외합니다.</div>
         <p>직접 입력도 유지됩니다. 쉼표로 값을 구분하며 CSV 따옴표를 쓸 수 있습니다. 다만 이름의 공백·기호와 현재 레이어 조건을 안전하게 반영하려면 목록 선택을 우선 사용하세요. 레이어 선택을 바꾼 뒤에는 NET 목록을 다시 확인하세요.</p>
       </section>
 
@@ -139,7 +139,7 @@
           <li><strong>허용 클라이언트 IP (선택)</strong>에는 접속을 허용할 노트북의 IP 주소를 입력합니다. 여러 개는 쉼표로 구분합니다.</li>
           <li><strong>Allegro 실행 파일</strong>은 기본 <code>C:\Cadence\SPB_24.1\tools\bin\allegro.exe</code>를 확인하거나 실제 설치 경로로 바꿉니다.</li>
           <li><strong>작업 폴더</strong>는 Agent가 전송 파일과 작업 결과를 보관할 로컬 폴더입니다. 결과와 백업, 로그를 둘 충분한 디스크 공간을 확보합니다.</li>
-          <li><strong>Agent 시작</strong>을 누릅니다. 표시되는 <strong>토큰</strong>과 <strong>인증서 지문</strong>을 노트북에 안전하게 옮깁니다. 토큰은 클라이언트에 저장되지 않으므로 앱을 다시 열면 다시 붙여 넣습니다.</li>
+          <li><strong>Agent 시작</strong>을 누릅니다. 표시되는 <strong>토큰</strong>과 <strong>인증서 지문</strong>을 옆의 <strong>복사</strong> 버튼으로 노트북에 안전하게 옮깁니다. 실행 중인 작업이 있으면 <strong>Agent 중지</strong>와 창 닫기 전에 확인을 요청합니다. 토큰은 클라이언트에 저장되지 않으므로 앱을 다시 열면 다시 붙여 넣습니다.</li>
         </ol>
         <p><strong>BRD-SPD-IPC2581 Workstation Agent</strong> 별도 실행 파일도 계속 사용할 수 있습니다. 기존 설정과 연결 방식은 호환됩니다.</p>
         <div class="callout"><strong>노트북에 넣을 IP:</strong> 예를 들어 Agent가 <code>0.0.0.0</code>에 바인드되어도 노트북의 <strong>워크스테이션 IP</strong>에는 실제 워크스테이션의 연결 가능한 주소를 입력합니다. 문서 예시 주소는 <code>192.0.2.16</code>이며 실제 환경 주소가 아닙니다.</div>
@@ -150,7 +150,7 @@
         <p class="lead">PID를 비워 두면 Agent는 전송된 원본 BRD로 별도 Allegro 작업을 실행합니다. 이 방식은 현재 열려 있는 사용자 Allegro 창을 대상으로 하지 않습니다.</p>
         <table class="fields"><caption>원격 Allegro 작업 탭 입력</caption><tbody>
           <tr><th>워크스테이션 IP / 포트</th><td>예: <code>192.0.2.16</code>, 기본 포트 <code>8765</code>. Agent 화면의 실제 연결 가능한 워크스테이션 주소를 씁니다.</td></tr>
-          <tr><th>접속 토큰 / 인증서 지문</th><td>Agent 시작 후 표시된 값을 그대로 입력합니다. 토큰을 로그, 캡처, 공유 문서에 남기지 마세요.</td></tr>
+          <tr><th>접속 토큰 / 인증서 지문</th><td>Agent 시작 후 표시된 값을 그대로 입력합니다. 붙여 넣은 값을 확인하려면 <strong>토큰 표시</strong>를 켭니다. 토큰을 로그, 캡처, 공유 문서에 남기지 마세요.</td></tr>
           <tr><th>Allegro PID (빈칸: 새 실행)</th><td><strong>빈칸</strong>으로 둡니다.</td></tr>
           <tr><th>SPD 입력 / 원본 BRD</th><td>수정 SPD와 같은 보드의 원본 BRD를 모두 선택합니다.</td></tr>
           <tr><th>출력 ZIP</th><td>아직 없는 새 ZIP 파일 경로를 지정합니다. 기존 ZIP은 덮어쓰지 않습니다.</td></tr>
@@ -160,7 +160,7 @@
           <li>먼저 <strong>노트북 (작업 요청)</strong> 역할을 선택합니다.</li>
           <li><strong>연결 확인</strong>으로 토큰, 인증서, 네트워크 상태를 먼저 확인합니다. 이는 SPD를 불러오기 전에도 할 수 있습니다.</li>
           <li><strong>SPD 입력</strong>에서 <strong>찾아보기…</strong>로 선택하거나 경로 입력 뒤 <strong>SPD 불러오기</strong>를 누릅니다. 성공한 뒤에만 범위, 부품 옵션, <strong>전송 및 실행</strong>이 활성화됩니다.</li>
-          <li>필드를 채운 뒤 <strong>전송 및 실행</strong>을 누릅니다. 업로드와 실행 상태는 <strong>원격 작업 로그</strong>에서 봅니다.</li>
+          <li>필드를 채운 뒤 <strong>전송 및 실행</strong>을 누릅니다. 업로드와 실행 상태는 <strong>원격 작업 로그</strong>에서 봅니다. 로그를 위로 스크롤하면 자동 이동이 멈추며, 마우스 오른쪽 버튼 메뉴로 <strong>복사</strong>와 <strong>로그 저장…</strong>을 사용할 수 있습니다. <strong>취소</strong>는 실행 중인 원격 작업에만 사용할 수 있고, 취소된 작업은 로그 ZIP을 저장한 뒤 취소됨으로 표시합니다. 완료 후 <strong>결과 폴더 열기</strong>로 저장 위치를 엽니다.</li>
           <li>완료되면 새 출력 ZIP을 받습니다. 작업 ID를 보관하면 앱을 다시 열어도 <strong>기존 작업 받기</strong>로 상태와 결과를 조회할 수 있습니다.</li>
         </ol>
       </section>

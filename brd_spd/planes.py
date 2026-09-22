@@ -1,11 +1,21 @@
 """Associate explicit negative SPD shapes with positive contours, without tessellation."""
 import json
+import math
 
 from shapely.geometry import Point, Polygon
 from shapely import prepare
 from shapely.strtree import STRtree
 
 from .geometry import el, ring, circle_ring, feature_set, num
+
+_QUAD_SEGS = 32
+# Circumscribed: an inscribed polygon would report a concentric void that is
+# barely smaller than its parent circle as not contained.
+_CIRCLE_LOOKUP_SCALE = 1.0 / math.cos(math.pi / (4 * _QUAD_SEGS))
+
+
+def _lookup_disk(data):
+    return Point(data[:2]).buffer(data[2] * _CIRCLE_LOOKUP_SCALE, quad_segs=_QUAD_SEGS)
 
 
 def write_planes(db, section, output, report, scale=1):
@@ -19,8 +29,8 @@ def write_planes(db, section, output, report, scale=1):
         if kind == "Polygon":
             shape = Polygon(list(zip(data[::2], data[1::2])))
         else:
-            # ponytail: use a bounding disk only for containment lookup; emitted circles remain exact arcs.
-            shape = Point(data[:2]).buffer(data[2], quad_segs=32)
+            # Use a bounding disk only for containment lookup; emitted circles remain exact arcs.
+            shape = _lookup_disk(data)
         is_valid = shape.is_valid
         if not is_valid:
             report.warn("INVALID_PLANE_TOPOLOGY", f"Shape row {rowid}; emitted unchanged, void assignment needs review")
@@ -35,7 +45,7 @@ def write_planes(db, section, output, report, scale=1):
     for rowid, net, kind, encoded, line in db.execute(
             "SELECT rowid,net,kind,data,line FROM shapes WHERE section=? AND polarity='-'", (section,)):
         data = json.loads(encoded)
-        hole = Polygon(list(zip(data[::2], data[1::2]))) if kind == "Polygon" else Point(data[:2]).buffer(data[2], quad_segs=32)
+        hole = Polygon(list(zip(data[::2], data[1::2]))) if kind == "Polygon" else _lookup_disk(data)
         hole_valid = hole.is_valid
         parents = []
         if tree is not None:

@@ -1,4 +1,5 @@
 import gc
+import re
 import threading
 import time
 import tkinter as tk
@@ -213,3 +214,131 @@ def test_cache_reuse_invalidation_and_stale_apply_guard(
     assert errors and "스캔 후 변경" in errors[-1][1]
     assert str(changed.apply_button["state"]) == "disabled"
     changed.close()
+
+
+def test_filter_narrows_view_case_insensitively_and_preserves_hidden_selection(
+        tk_root, tmp_path, monkeypatch):
+    source = tmp_path / "filter_ui.spd"
+    source.write_bytes(b"spd")
+    monkeypatch.setattr(
+        selection_ui, "_scan_catalog", lambda path, progress, cancelled: CATALOG
+    )
+    applied = []
+    picker = selection_ui.open_target_picker(
+        tk_root, source, "nets", None, None, applied.append
+    )
+    _pump(tk_root, lambda: picker._loaded)
+    assert _items(picker) == CATALOG["nets"]
+    assert picker.selected_names == set(CATALOG["nets"])
+
+    # A case-insensitive substring filter narrows what the listbox shows.
+    picker.filter_var.set("net")
+    tk_root.update()
+    assert _items(picker) == ["NET,WITH,COMMA"]
+
+    # Deselecting the only visible row only affects that row's tracked name.
+    picker.listbox.selection_clear(0, tk.END)
+    picker._selection_changed()
+    assert picker.selected_names == {"GND", "N2"}
+
+    # Widening the filter again brings GND and N2 back, still selected,
+    # even though they were hidden while the filter was narrow.
+    picker.filter_var.set("")
+    tk_root.update()
+    assert _items(picker) == CATALOG["nets"]
+    shown_selected = {picker.listbox.get(i) for i in picker.listbox.curselection()}
+    assert shown_selected == {"GND", "N2"}
+
+    picker.apply()
+    assert applied == [["GND", "N2"]]
+
+
+def test_select_all_scopes_to_filtered_view_and_clear_clears_everything(
+        tk_root, tmp_path, monkeypatch):
+    source = tmp_path / "filter_scope.spd"
+    source.write_bytes(b"spd")
+    monkeypatch.setattr(
+        selection_ui, "_scan_catalog", lambda path, progress, cancelled: CATALOG
+    )
+    picker = selection_ui.open_target_picker(
+        tk_root, source, "nets", [], None, lambda values: None
+    )
+    _pump(tk_root, lambda: picker._loaded)
+    assert picker.listbox.curselection() == ()
+    assert picker.selected_names == set()
+
+    picker.filter_var.set("n2")
+    tk_root.update()
+    assert _items(picker) == ["N2"]
+    picker.select_all()
+    # 전체 선택 only selects the currently visible (filtered) items.
+    assert picker.selected_names == {"N2"}
+
+    picker.filter_var.set("")
+    tk_root.update()
+    # N2 stays selected even though it was hidden again by widening the filter.
+    assert picker.selected_names == {"N2"}
+    assert {picker.listbox.get(i) for i in picker.listbox.curselection()} == {"N2"}
+
+    picker.clear_all()
+    # 선택 해제 clears everything, including items outside the current filter.
+    assert picker.selected_names == set()
+    assert picker.listbox.curselection() == ()
+    assert str(picker.apply_button["state"]) == "disabled"
+
+
+def _fire_binding(widget, sequence):
+    """Invoke the Python handler bound to ``sequence`` on ``widget``.
+
+    Synthesized key and double-click events only reach a window that owns
+    the keyboard focus, which a headless Windows runner never grants, so the
+    registered handler is invoked through the same Tcl command Tk would call.
+    """
+    script = widget.bind(sequence)
+    assert script, f"{sequence} is not bound on {widget}"
+    command = re.search(r"\[(\S+)\s", script).group(1)
+    substitutions = ["??"] * 19
+    substitutions[0] = "0"  # %# serial must be an integer
+    substitutions[14] = str(widget)  # %W
+    widget.tk.call(command, *substitutions)
+
+
+def test_return_applies_escape_closes_and_double_click_applies(
+        tk_root, tmp_path, monkeypatch):
+    source = tmp_path / "keys.spd"
+    source.write_bytes(b"spd")
+    monkeypatch.setattr(
+        selection_ui, "_scan_catalog", lambda path, progress, cancelled: CATALOG
+    )
+
+    applied = []
+    picker = selection_ui.open_target_picker(
+        tk_root, source, "layers", None, None, applied.append
+    )
+    _pump(tk_root, lambda: picker._loaded)
+    _fire_binding(picker, "<Return>")
+    tk_root.update()
+    assert applied == [CATALOG["layers"]]
+    assert picker._closed
+
+    applied_escape = []
+    picker2 = selection_ui.open_target_picker(
+        tk_root, source, "layers", None, None, applied_escape.append
+    )
+    _pump(tk_root, lambda: picker2._loaded)
+    _fire_binding(picker2, "<Escape>")
+    tk_root.update()
+    assert picker2._closed
+    assert applied_escape == []
+
+    applied_double_click = []
+    picker3 = selection_ui.open_target_picker(
+        tk_root, source, "layers", [], None, applied_double_click.append
+    )
+    _pump(tk_root, lambda: picker3._loaded)
+    picker3.listbox.selection_set(0)
+    picker3._selection_changed()
+    _fire_binding(picker3.listbox, "<Double-Button-1>")
+    tk_root.update()
+    assert applied_double_click == [[CATALOG["layers"][0]]]
+    assert picker3._closed

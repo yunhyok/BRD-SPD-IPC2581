@@ -34,12 +34,17 @@ def inspect_spd(path: str | Path, progress=None) -> dict:
                 key = first.decode("ascii", "replace")
                 directives[key] += 1
                 if first == b".Shape":
-                    shape = line.split()[1].decode("utf-8", "replace")
+                    fields = line.split()
+                    if len(fields) < 2:
+                        raise ValueError(f"line {lines}: .Shape requires a name")
+                    shape = fields[1].decode("utf-8", "replace")
                     layer_shapes.setdefault(shape, Counter())
                 elif first == b".EndShape":
                     shape = None
                 elif first == b".Component":
                     tokens = line.decode("utf-8", "replace").split()
+                    if len(tokens) < 2:
+                        raise ValueError(f"line {lines}: .Component requires a refdes")
                     components[tokens[1]] = " ".join(tokens[2:])
             elif shape is not None:
                 match = re.match(rb"([A-Za-z]+)", first)

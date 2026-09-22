@@ -20,6 +20,14 @@ SMTO_BLOCK = 0x0001
 SMTO_ABORTIFHUNG = 0x0002
 
 
+class DispatchNotAttempted(RuntimeError):
+    """A pre-dispatch check failed, so no command reached the target window.
+
+    Callers must treat this as a plain failure: nothing was sent, therefore no
+    native execution can be pending and no cancellation marker is required.
+    """
+
+
 def _validated_pid(pid: int) -> int:
     if isinstance(pid, bool) or not isinstance(pid, int):
         raise TypeError("pid must be an integer")
@@ -152,28 +160,38 @@ class _WindowsMessageAPI:
 
     def windows(self) -> list[dict[str, Any]]:
         windows: list[dict[str, Any]] = []
+        failures: list[BaseException] = []
 
         @self._enum_type
         def callback(hwnd, _lparam):
-            process_id = self.wintypes.DWORD()
-            self.user32.GetWindowThreadProcessId(hwnd, self.ctypes.byref(process_id))
-            title_length = self.user32.GetWindowTextLengthW(hwnd)
-            title = ""
-            if title_length > 0:
-                buffer = self.ctypes.create_unicode_buffer(title_length + 1)
-                self.user32.GetWindowTextW(hwnd, buffer, len(buffer))
-                title = buffer.value
-            windows.append({
-                "hwnd": int(hwnd),
-                "pid": int(process_id.value),
-                "visible": bool(self.user32.IsWindowVisible(hwnd)),
-                "owner": int(self.user32.GetWindow(hwnd, 4) or 0),  # GW_OWNER
-                "title": title,
-            })
+            # ctypes swallows exceptions raised inside a callback, which would
+            # stop enumeration early and return a silently partial window list.
+            try:
+                process_id = self.wintypes.DWORD()
+                self.user32.GetWindowThreadProcessId(hwnd, self.ctypes.byref(process_id))
+                title_length = self.user32.GetWindowTextLengthW(hwnd)
+                title = ""
+                if title_length > 0:
+                    buffer = self.ctypes.create_unicode_buffer(title_length + 1)
+                    self.user32.GetWindowTextW(hwnd, buffer, len(buffer))
+                    title = buffer.value
+                windows.append({
+                    "hwnd": int(hwnd),
+                    "pid": int(process_id.value),
+                    "visible": bool(self.user32.IsWindowVisible(hwnd)),
+                    "owner": int(self.user32.GetWindow(hwnd, 4) or 0),  # GW_OWNER
+                    "title": title,
+                })
+            except BaseException as exc:
+                failures.append(exc)
+                return False
             return True
 
         self.ctypes.set_last_error(0)
-        if not self.user32.EnumWindows(callback, 0):
+        enumerated = self.user32.EnumWindows(callback, 0)
+        if failures:
+            raise failures[0]
+        if not enumerated:
             error = self.ctypes.get_last_error()
             if error:
                 raise self.ctypes.WinError(error)
@@ -314,38 +332,48 @@ def _dispatch_command_windows(pid: int, expected_executable: Path,
                               expected_identity: dict[str, Any], command: str,
                               timeout_ms: int = 2000, process_api=None,
                               window_api=None) -> dict[str, Any]:
-    pid = _validated_pid(pid)
-    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
-        raise TypeError("timeout_ms must be an integer")
-    if timeout_ms <= 0 or timeout_ms > MAX_DWORD:
-        raise ValueError("timeout_ms must be between 1 and 4294967295")
-    if expected_identity is None:
-        raise ValueError("expected_identity is required for PID reuse protection")
-    payload = _encode_command(command)
-    process_api = process_api or _WindowsProcessAPI()
-    window_api = window_api or _WindowsMessageAPI()
-    handle = process_api.open(pid)
+    handle = None
     try:
-        current = _identity_from_handle(pid, process_api, handle)
-        _validate_identity(pid, expected_executable, expected_identity, current)
-        matches = [
-            window for window in window_api.windows()
-            if window["pid"] == pid and window["visible"] and not window["owner"]
-            and "allegro" in str(window["title"]).casefold()
-        ]
-        if not matches:
-            raise RuntimeError(f"no eligible Allegro window belongs to process {pid}")
-        if len(matches) != 1:
-            raise RuntimeError(f"multiple eligible Allegro windows belong to process {pid}")
-        hwnd = int(matches[0]["hwnd"])
-        if window_api.window_pid(hwnd) != pid:
-            raise RuntimeError("target window ownership changed before dispatch")
-        if not process_api.alive(handle):
-            raise ProcessLookupError(f"process {pid} exited before command dispatch")
+        # Every check below runs before a single byte is sent.  Failures here
+        # are reported as DispatchNotAttempted so callers can record a plain
+        # failure instead of an unobserved native execution.
+        try:
+            pid = _validated_pid(pid)
+            if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
+                raise TypeError("timeout_ms must be an integer")
+            if timeout_ms <= 0 or timeout_ms > MAX_DWORD:
+                raise ValueError("timeout_ms must be between 1 and 4294967295")
+            if expected_identity is None:
+                raise ValueError("expected_identity is required for PID reuse protection")
+            payload = _encode_command(command)
+            process_api = process_api or _WindowsProcessAPI()
+            window_api = window_api or _WindowsMessageAPI()
+            handle = process_api.open(pid)
+            current = _identity_from_handle(pid, process_api, handle)
+            _validate_identity(pid, expected_executable, expected_identity, current)
+            matches = [
+                window for window in window_api.windows()
+                if window["pid"] == pid and window["visible"] and not window["owner"]
+                and "allegro" in str(window["title"]).casefold()
+            ]
+            if not matches:
+                raise DispatchNotAttempted(f"no eligible Allegro window belongs to process {pid}")
+            if len(matches) != 1:
+                raise DispatchNotAttempted(f"multiple eligible Allegro windows belong to process {pid}")
+            hwnd = int(matches[0]["hwnd"])
+            if window_api.window_pid(hwnd) != pid:
+                raise DispatchNotAttempted("target window ownership changed before dispatch")
+            if not process_api.alive(handle):
+                raise DispatchNotAttempted(f"process {pid} exited before command dispatch")
+        except DispatchNotAttempted:
+            raise
+        except BaseException as exc:
+            raise DispatchNotAttempted(str(exc) or type(exc).__name__) from exc
         accepted, timed_out = window_api.send_copydata(hwnd, payload, timeout_ms)
         return {"accepted": bool(accepted), "timed_out": bool(timed_out), "hwnd": hwnd}
     finally:
-        process_api.close(handle)
+        if handle is not None:
+            process_api.close(handle)
 
 
 def dispatch_command(pid: int, expected_executable: Path,
@@ -354,7 +382,8 @@ def dispatch_command(pid: int, expected_executable: Path,
     """Send one bounded Cadence command to exactly one PID-owned Allegro window.
 
     A timeout means delivery is unknown; callers must poll the native result
-    marker and must not retry the command automatically.
+    marker and must not retry the command automatically.  Any failure raised
+    before the command leaves this process is a :class:`DispatchNotAttempted`.
     """
     if os.name != "nt":
         raise OSError("Cadence command dispatch is supported only on Windows")

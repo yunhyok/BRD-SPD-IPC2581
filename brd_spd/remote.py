@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -141,11 +142,15 @@ def _create_certificate(datadir: Path, host: str) -> tuple[Path, Path, str]:
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
             .sign(key, hashes.SHA256())
         )
-        key_path.write_bytes(key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ))
+        # Create the private key with owner-only permissions from the start so
+        # it is never briefly readable by other local accounts.
+        descriptor = os.open(key_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ))
         cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
         try:
             key_path.chmod(0o600)
@@ -247,7 +252,11 @@ class WorkstationAgent:
                 raise ValueError("existing token.txt is too short")
             return token
         token = secrets.token_urlsafe(32)
-        path.write_text(token + "\n", encoding="ascii")
+        # Create with owner-only permissions instead of tightening them after
+        # the secret is already on disk.
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(token + "\n")
         try:
             path.chmod(0o600)
         except OSError:
@@ -351,7 +360,12 @@ class WorkstationAgent:
             self._stopping.set()
             for job_id, event in list(self._cancel.items()):
                 event.set()
-                self._signal_session_cancel(job_id)
+                try:
+                    self._signal_session_cancel(job_id)
+                except (OSError, ValueError):
+                    # A removed or unreadable job directory must not keep the
+                    # agent running.
+                    pass
             for process in list(self._processes.values()):
                 self._terminate(process)
             server = self._server
@@ -365,9 +379,14 @@ class WorkstationAgent:
             self._worker_thread.join(timeout=15)
         with self._lock:
             if self._worker_thread and self._worker_thread.is_alive():
-                self._server = None
-                self._server_thread = None
-                raise RuntimeError("agent runner is awaiting cooperative cancellation; an existing Allegro session will not be terminated")
+                # Never leave the agent half-stopped: the daemon runner keeps
+                # awaiting cooperative cancellation while the server, the state
+                # flag and the data directory lock are released regardless.
+                warnings.warn(
+                    "agent runner is still awaiting cooperative cancellation; "
+                    "an existing Allegro session will not be terminated",
+                    RuntimeWarning, stacklevel=2,
+                )
             self._server = None
             self._server_thread = None
             self._worker_thread = None
@@ -426,7 +445,28 @@ class WorkstationAgent:
 
     @staticmethod
     def _public(state: dict[str, Any]) -> dict[str, Any]:
-        return {k: v for k, v in state.items() if k not in {"internal"}}
+        """Return a copy so callers never mutate a persisted state dictionary."""
+        return dict(state)
+
+    @property
+    def running_job_ids(self) -> list[str]:
+        """Ids of persisted jobs that are queued, running, or cancel_requested.
+
+        Read-only and cheap: it reads the persisted state under the same lock as
+        the state writers and never reconciles, archives, or dispatches.
+        """
+        active: list[str] = []
+        with self._lock:
+            for directory in sorted(self._jobs_dir.iterdir()):
+                try:
+                    job_id = _job_id(directory.name)
+                    state = json.loads((directory / "job.json").read_text(encoding="utf-8"))
+                except (ValueError, OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(state, dict) and state.get("status") in {
+                        "queued", "running", "cancel_requested"}:
+                    active.append(job_id)
+        return active
 
     def create_job(self, options: Any) -> dict[str, Any]:
         options = _safe_options(options)
@@ -638,8 +678,12 @@ class WorkstationAgent:
         directory = self._job_dir(job_id)
         bundle = directory / "bundle"
         event = self._cancel.setdefault(job_id, threading.Event())
-        self._update(job_id, status="running", started_utc=_utcnow())
-        state = self._state(job_id)
+        with self._lock:
+            # A cancel may have published a terminal state after the worker
+            # dequeued this job; a terminal job is never resurrected.
+            if self._state(job_id)["status"] in _TERMINAL_STATES:
+                return
+            state = self._update(job_id, status="running", started_utc=_utcnow())
         if state.get("session_dispatched"):
             self._log(job_id, "resuming existing-session observation without re-dispatch")
             self._monitor_session(job_id, bundle, state)
@@ -678,7 +722,6 @@ class WorkstationAgent:
             self._copy_native_log(bundle / "execution.log", log_stream, native_offset)
             with self._lock:
                 self._processes.pop(job_id, None)
-        shutil.copy2(log_path, directory / "execution.log")
         self._update(job_id, return_code=return_code)
         if event.is_set():
             self._log(job_id, "native execution cancelled")
@@ -705,6 +748,7 @@ class WorkstationAgent:
                                 state["target_process"], command)
 
     def _run_session(self, job_id: str, bundle: Path, state: dict) -> None:
+        from .process_target import DispatchNotAttempted
         from .skill import _skill_string
         pid = state["options"]["allegro_pid"]
         self.check_pid(pid, state["target_process"])
@@ -716,7 +760,13 @@ class WorkstationAgent:
                 raise _Cancelled("cancelled before dispatch")
             self._update(job_id, session_dispatched=True)
         self._log(job_id, f"dispatching to existing Allegro PID {pid}; using its currently open BRD")
-        delivery = self._dispatch_session(state, command)
+        try:
+            delivery = self._dispatch_session(state, command)
+        except DispatchNotAttempted:
+            # No command left this process, so the job is a plain failure
+            # rather than an unobserved native execution.
+            self._update(job_id, session_dispatched=False)
+            raise
         self._update(job_id, delivery=delivery)
         if delivery["timed_out"]:
             self._log(job_id, "message delivery timed out; awaiting native markers without resending")
@@ -827,11 +877,24 @@ class WorkstationAgent:
                 _atomic_json(directory / "job.json", final)
                 return self._public(final)
 
-    @staticmethod
-    def _make_result_archive(directory: Path, bundle: Path, include_board: bool,
+    def _make_result_archive(self, directory: Path, bundle: Path, include_board: bool,
                              job_state: dict[str, Any] | None = None) -> Path:
         destination = directory / "result.zip"
         temporary = directory / f"result.zip.{threading.get_ident()}.tmp"
+        try:
+            self._write_result_archive(temporary, directory, bundle, include_board, job_state)
+            # Windows refuses to replace a file a download still holds open, so
+            # publishing shares the lock with the handler's stat and open.
+            with self._lock:
+                os.replace(temporary, destination)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return destination
+
+    @staticmethod
+    def _write_result_archive(temporary: Path, directory: Path, bundle: Path, include_board: bool,
+                              job_state: dict[str, Any] | None = None) -> None:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
             candidates = [
                 (directory / "runner.log", "agent-runner.log"),
@@ -856,8 +919,6 @@ class WorkstationAgent:
                 archive.writestr("job.json", json.dumps(
                     job_state, ensure_ascii=False, indent=2
                 ).encode("utf-8"))
-        os.replace(temporary, destination)
-        return destination
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         state = self._state(job_id)
@@ -915,15 +976,36 @@ class WorkstationAgent:
                                       include_board=state["status"] == "succeeded", job_state=state)
         return path
 
+    def open_result(self, job_id: str) -> tuple[int, Any]:
+        """Open the published archive and report its size under the state lock.
+
+        The lock is held only for the stat and the open so a concurrent publish
+        cannot replace the file mid-measurement; the transfer itself runs after
+        the lock is released.
+        """
+        path = self.result_path(job_id)
+        with self._lock:
+            return path.stat().st_size, path.open("rb")
+
     def client_allowed(self, address: str) -> bool:
         if self._allowed is None:
             return True
-        ip = ipaddress.ip_address(address.split("%", 1)[0])
+        try:
+            ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+        except ValueError:
+            return False
         return any(ip in network for network in self._allowed)
 
     def authorized(self, header: str | None) -> bool:
-        expected = "Bearer " + self._token
-        return bool(header) and hmac.compare_digest(header, expected)
+        if not header:
+            return False
+        try:
+            # Headers are decoded as latin-1, so a non-ASCII value would make
+            # compare_digest raise instead of simply failing authentication.
+            provided = header.encode("ascii")
+        except (AttributeError, UnicodeEncodeError):
+            return False
+        return hmac.compare_digest(provided, ("Bearer " + self._token).encode("ascii"))
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -965,12 +1047,14 @@ class _Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def _dispatch(self, method: str) -> None:
-        if not self._guard():
-            return
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
         parts = [part for part in path.split("/") if part]
         try:
+            # The guard runs inside the try so a hostile header can never leave
+            # the connection without a response.
+            if not self._guard():
+                return
             if method == "GET" and parts == ["v1", "health"]:
                 self._json(200, {"status": "ok", "protocol": PROTOCOL_VERSION, "runner_slots": 1,
                                  "max_upload_bytes": self.agent.config.max_upload_bytes,
@@ -1006,13 +1090,13 @@ class _Handler(BaseHTTPRequestHandler):
                         raise ValueError("Content-Length is required")
                     self._json(200, self.agent.upload(job_id, parts[4], self.rfile, int(raw_length))); return
                 if method == "GET" and parts[3:] == ["result"]:
-                    result = self.agent.result_path(job_id)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Length", str(result.stat().st_size))
-                    self.send_header("Content-Disposition", 'attachment; filename="result.zip"')
-                    self.end_headers()
-                    with result.open("rb") as stream:
+                    size, stream = self.agent.open_result(job_id)
+                    with stream:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/zip")
+                        self.send_header("Content-Length", str(size))
+                        self.send_header("Content-Disposition", 'attachment; filename="result.zip"')
+                        self.end_headers()
                         shutil.copyfileobj(stream, self.wfile, 1024 * 1024)
                     return
             self._json(404, {"error": "route not found"})
@@ -1024,6 +1108,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": str(exc)})
         except OSError as exc:
             self._json(409, {"error": str(exc)})
+        except Exception:
+            self._json(500, {"error": "internal agent error"})
 
     def do_GET(self):
         self._dispatch("GET")
@@ -1040,7 +1126,14 @@ class RemoteClient:
 
     def __init__(self, host, port=8765, token="", fingerprint="", timeout=30):
         self.host, self.port = str(host), int(port)
-        self.token, self.fingerprint = str(token), str(fingerprint)
+        self.token = str(token)
+        # Normalize once so pinning cannot be disabled by a value such as ":"
+        # or by surrounding whitespace that only looks like a fingerprint.
+        given = str(fingerprint)
+        self.fingerprint = given.replace(":", "").strip().lower()
+        if given.strip() and (len(self.fingerprint) != 64 or
+                              self.fingerprint.strip("0123456789abcdef")):
+            raise ValueError("fingerprint must be 64 hex characters")
         self.timeout = timeout
         if not self.fingerprint and not _is_loopback(self.host):
             raise ValueError("TLS certificate fingerprint is required for a non-loopback agent")
@@ -1052,7 +1145,7 @@ class RemoteClient:
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout, context=context)
         connection.connect()
         actual = _fingerprint(connection.sock.getpeercert(binary_form=True))
-        expected = self.fingerprint.replace(":", "").lower()
+        expected = self.fingerprint
         if expected and not hmac.compare_digest(actual, expected):
             connection.close()
             raise ssl.SSLError("agent TLS certificate fingerprint mismatch")

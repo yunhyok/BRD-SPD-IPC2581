@@ -137,3 +137,20 @@ def test_source_change_during_scan_is_rejected(tmp_path):
 
     with pytest.raises(RuntimeError, match="changed"):
         scan_catalog(source, progress=change_after_signature)
+
+
+def test_section_patched_onto_two_layers_is_offered_on_both(tmp_path):
+    source = tmp_path / "multilayer.spd"
+    source.write_bytes(
+        "﻿.Shape shared_plane\nPolygon1::PWR+ 0mm 0mm 1mm 0mm 0mm 1mm\n.EndShape\n"
+        "Signal$TOP Thickness = 35um Material = COPPER\n"
+        "Signal$BOTTOM Thickness = 35um Material = COPPER\n"
+        "PatchSignal$TOP Shape = shared_plane Layer = Signal$TOP\n"
+        "PatchSignal$BOTTOM Shape = shared_plane Layer = Signal$BOTTOM\n".encode("utf-8")
+    )
+
+    assert scan_catalog(source) == {
+        "layers": ["TOP", "BOTTOM"],
+        "nets": ["PWR"],
+        "nets_by_layer": {"TOP": ["PWR"], "BOTTOM": ["PWR"]},
+    }

@@ -89,3 +89,18 @@ def test_snapshot_copy_honors_cancellation_and_cleans_up(tmp_path):
             raise AssertionError("cancelled copy must not be exposed")
     assert checks >= 2
     assert _temporary_snapshots(tmp_path) == []
+
+
+def test_copy_reports_byte_progress_up_to_the_total(tmp_path):
+    source = tmp_path / "large.spd"
+    source.write_bytes(b"a" * (9 * 1024 * 1024))
+    reports = []
+
+    with source_snapshot(source, catalog_signature(source), tmp_path,
+                         progress=lambda copied, total: reports.append((copied, total))) as snapshot:
+        assert snapshot.stat().st_size == 9 * 1024 * 1024
+
+    assert reports, "a multi-chunk copy must report progress"
+    assert [copied for copied, _ in reports] == sorted(copied for copied, _ in reports)
+    assert all(total == 9 * 1024 * 1024 for _, total in reports)
+    assert reports[-1] == (9 * 1024 * 1024, 9 * 1024 * 1024)
