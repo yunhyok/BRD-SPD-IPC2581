@@ -138,13 +138,20 @@ class TargetPicker(tk.Toplevel):
         self._closed = False
         self._loaded = False
         self._source_key = None
+        # The full, unfiltered catalog for this dialog, and the selection
+        # tracked by item name (not listbox index) so it survives filtering.
+        self.all_items: list[str] = []
+        self.selected_names: set[str] = set()
+        self._visible_items: list[str] = []
 
         self.title("레이어 선택" if kind == "layers" else "네트 선택")
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.minsize(430, 420)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
+        self.bind("<Return>", lambda _event: self.apply())
+        self.bind("<Escape>", lambda _event: self.close())
 
         heading = "반영할 레이어를 선택하세요." if kind == "layers" else "반영할 NET을 선택하세요."
         ttk.Label(self, text=heading, font=("Malgun Gothic", 11, "bold")).grid(
@@ -154,8 +161,17 @@ class TargetPicker(tk.Toplevel):
             row=1, column=0, sticky="w", padx=12, pady=(0, 8)
         )
 
+        filter_frame = ttk.Frame(self)
+        filter_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+        filter_frame.columnconfigure(1, weight=1)
+        ttk.Label(filter_frame, text="검색").grid(row=0, column=0, sticky="w")
+        self.filter_var = tk.StringVar()
+        self.filter_entry = ttk.Entry(filter_frame, textvariable=self.filter_var, state="disabled")
+        self.filter_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.filter_var.trace_add("write", self._on_filter_changed)
+
         list_frame = ttk.Frame(self)
-        list_frame.grid(row=2, column=0, sticky="nsew", padx=12)
+        list_frame.grid(row=3, column=0, sticky="nsew", padx=12)
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
         self.listbox = tk.Listbox(
@@ -169,9 +185,10 @@ class TargetPicker(tk.Toplevel):
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
         self.listbox.bind("<<ListboxSelect>>", self._selection_changed)
+        self.listbox.bind("<Double-Button-1>", lambda _event: self.apply())
 
         controls = ttk.Frame(self)
-        controls.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 0))
+        controls.grid(row=4, column=0, sticky="ew", padx=12, pady=(8, 0))
         self.select_all_button = ttk.Button(controls, text="전체 선택", command=self.select_all)
         self.clear_button = ttk.Button(controls, text="선택 해제", command=self.clear_all)
         self.select_all_button.pack(side="left")
@@ -179,10 +196,10 @@ class TargetPicker(tk.Toplevel):
 
         self.status = tk.StringVar(value="SPD 카탈로그를 읽는 중…")
         ttk.Label(self, textvariable=self.status).grid(
-            row=4, column=0, sticky="w", padx=12, pady=(8, 3)
+            row=5, column=0, sticky="w", padx=12, pady=(8, 3)
         )
         actions = ttk.Frame(self)
-        actions.grid(row=5, column=0, sticky="e", padx=12, pady=(3, 12))
+        actions.grid(row=6, column=0, sticky="e", padx=12, pady=(3, 12))
         ttk.Button(actions, text="닫기", command=self.close).pack(side="right")
         self.apply_button = ttk.Button(actions, text="적용", command=self.apply, state="disabled")
         self.apply_button.pack(side="right", padx=(0, 6))
@@ -261,45 +278,70 @@ class TargetPicker(tk.Toplevel):
             self._fail(str(exc))
             return
 
-        self.listbox.delete(0, tk.END)
-        for item in items:
-            self.listbox.insert(tk.END, item)
+        self.all_items = items
         wanted = set(items if self.initial_selected is None else self.initial_selected)
-        for index, item in enumerate(items):
-            if item in wanted:
-                self.listbox.selection_set(index)
+        self.selected_names = {item for item in items if item in wanted}
         self._loaded = True
         self.select_all_button.configure(state="normal")
         self.clear_button.configure(state="normal")
+        self.filter_entry.configure(state="normal")
+        self._refresh_listbox()
+
+    def _on_filter_changed(self, *_args) -> None:
+        if self._loaded:
+            self._refresh_listbox()
+
+    def _refresh_listbox(self) -> None:
+        query = self.filter_var.get().strip().lower()
+        if query:
+            visible = [item for item in self.all_items if query in item.lower()]
+        else:
+            visible = list(self.all_items)
+        self._visible_items = visible
+        self.listbox.delete(0, tk.END)
+        for item in visible:
+            self.listbox.insert(tk.END, item)
+        for index, item in enumerate(visible):
+            if item in self.selected_names:
+                self.listbox.selection_set(index)
         self._selection_changed()
 
     def _selection_changed(self, _event=None) -> None:
-        selected_count = len(self.listbox.curselection())
-        total = self.listbox.size()
+        selected_indices = set(self.listbox.curselection())
+        for index, item in enumerate(self._visible_items):
+            if index in selected_indices:
+                self.selected_names.add(item)
+            else:
+                self.selected_names.discard(item)
+        selected_count = len(self.selected_names)
+        total = len(self.all_items) if self._loaded else self.listbox.size()
         self.status.set(f"{selected_count}개 선택 / 전체 {total}개")
         self.apply_button.configure(state="normal" if self._loaded and selected_count else "disabled")
 
     def select_all(self) -> None:
+        # Only the currently visible (filtered) items are selected; items
+        # hidden by the filter keep whatever selection state they already had.
         if self._loaded:
             self.listbox.selection_set(0, tk.END)
             self._selection_changed()
 
     def clear_all(self) -> None:
+        # Clears the whole selection, including items hidden by the filter.
         self.listbox.selection_clear(0, tk.END)
+        self.selected_names.clear()
         self._selection_changed()
 
     def apply(self) -> None:
         if self._closed or not self._loaded:
             return
-        indices = self.listbox.curselection()
-        if not indices:
+        values = [item for item in self.all_items if item in self.selected_names]
+        if not values:
             messagebox.showerror("선택 필요", "하나 이상의 항목을 선택하세요.", parent=self)
             return
         try:
             if catalog_signature(self.source) != self._source_key:
                 self.apply_button.configure(state="disabled")
                 raise RuntimeError("SPD 파일이 스캔 후 변경되었습니다. 선택 창을 다시 여세요.")
-            values = [self.listbox.get(index) for index in indices]
             self.on_apply(values)
         except Exception as exc:
             messagebox.showerror("선택 적용 실패", str(exc), parent=self)
@@ -314,6 +356,7 @@ class TargetPicker(tk.Toplevel):
         self.apply_button.configure(state="disabled")
         self.select_all_button.configure(state="disabled")
         self.clear_button.configure(state="disabled")
+        self.filter_entry.configure(state="disabled")
         messagebox.showerror("SPD 선택", message, parent=self)
 
     def close(self) -> None:
