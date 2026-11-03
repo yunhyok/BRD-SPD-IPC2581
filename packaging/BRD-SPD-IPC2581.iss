@@ -1,6 +1,6 @@
-; Build with: ISCC /DMyAppVersion=0.5.0 packaging\BRD-SPD-IPC2581.iss
+; Build with: ISCC /DMyAppVersion=0.5.1 packaging\BRD-SPD-IPC2581.iss
 #ifndef MyAppVersion
-  #define MyAppVersion "0.5.0"
+  #define MyAppVersion "0.5.1"
 #endif
 
 #define MyAppName "BRD-SPD-IPC2581"
@@ -12,11 +12,12 @@ AppId={{9B1F50BF-79CD-4DBE-B615-BFB937DB702E}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\{#MyAppName}
+DefaultDirName={autopf}\{#MyAppName}
+DisableDirPage=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=commandline
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\dist\installer
 OutputBaseFilename=BRD-SPD-IPC2581-Setup-{#MyAppVersion}
 Compression=lzma2
