@@ -15,11 +15,21 @@ class Report:
                      "started_utc": datetime.now(timezone.utc).isoformat(),
                      "status": "running", "allegro_import_verified": False}
 
-    def warn(self, code, message, line=None):
-        item = self.warnings.setdefault(code, {"count": 0, "samples": []})
+    def warn(self, code, message, line=None, **details):
+        self._record(self.warnings, code, message, line, details)
+
+    def info(self, code, message, line=None, **details):
+        """Record non-warning evidence (for example reference inventory counts)."""
+        self._record(self.data.setdefault("info", {}), code, message, line, details)
+
+    @staticmethod
+    def _record(target, code, message, line, details):
+        item = target.setdefault(code, {"count": 0, "samples": []})
         item["count"] += 1
         if len(item["samples"]) < 5:
-            item["samples"].append({"line": line, "message": str(message)})
+            sample = {"line": line, "message": str(message)}
+            sample.update(details)
+            item["samples"].append(sample)
 
     def unsupported(self, code, line, text):
         self.warn(code, text, line)
@@ -39,6 +49,12 @@ class Report:
             lines.append(f"[{code}] occurrences={item['count']}")
             for sample in item["samples"]:
                 lines.append(f"  line={sample['line']}: {sample['message']}")
+        if self.data.get("info"):
+            lines += ["", "INFO"]
+            for code, item in self.data["info"].items():
+                lines.append(f"[{code}] occurrences={item['count']}")
+                for sample in item["samples"]:
+                    lines.append(f"  {sample['message']}")
         if "error" in details:
             lines += ["", "ERROR: " + str(details["error"])]
         log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

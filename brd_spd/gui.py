@@ -7,6 +7,7 @@ import csv
 import io
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -39,6 +40,147 @@ def parse_target_values(value: str) -> list[str] | None:
     return items
 
 
+def encode_target_values(values: list[str]) -> str:
+    """Encode selected names exactly as the picker writes them into an entry."""
+    encoded = io.StringIO()
+    csv.writer(encoded, lineterminator="").writerow(values)
+    return encoded.getvalue()
+
+
+def format_bytes(count: Any) -> str:
+    """Render a byte count as the short MB figure used in the Korean log."""
+    try:
+        return f"{int(count) / (1024 * 1024):.1f} MB"
+    except (TypeError, ValueError):
+        return str(count)
+
+
+_TRANSFER_PROGRESS = re.compile(r"^(?:Uploading (?P<slot>[A-Za-z]+)|Downloading result): (?P<done>\d+)/(?P<total>\d+) bytes$")
+
+
+def format_transfer(prefix: str, message: Any) -> str:
+    """Translate the client's English byte counters into one short Korean line."""
+    match = _TRANSFER_PROGRESS.match(str(message).strip())
+    if match is None:
+        return f"{prefix}: {message}"
+    slot = match.group("slot")
+    label = f"{prefix} {slot}" if slot else prefix
+    return f"{label}: {format_bytes(match.group('done'))} / {format_bytes(match.group('total'))}"
+
+
+def snapshot_progress(events: "queue.Queue[tuple[str, Any]]") -> Any:
+    """Report the working-copy copy loop as a short Korean byte line."""
+    def progress(copied: int, total: int) -> None:
+        events.put(("log", f"작업용 사본 복사 중: {format_bytes(copied)} / {format_bytes(total)}"))
+    return progress
+
+
+_FIELD_LABELS = {
+    "status": "상태", "protocol": "프로토콜 버전", "runner_slots": "실행 슬롯",
+    "max_upload_bytes": "최대 업로드", "capabilities": "기능", "id": "작업 ID",
+    "error": "오류", "return_code": "종료 코드", "result_bytes": "결과 크기",
+    "updated_utc": "갱신", "executable": "Allegro 경로", "pid": "PID",
+}
+_BYTE_FIELDS = {"max_upload_bytes", "result_bytes"}
+
+
+def format_fields(value: Any, keys: tuple[str, ...]) -> str:
+    """Show only the fields a user needs instead of a raw Python dict."""
+    if not isinstance(value, dict):
+        return str(value)
+    parts = []
+    for key in keys:
+        if key not in value:
+            continue
+        item = value[key]
+        if key in _BYTE_FIELDS:
+            item = format_bytes(item)
+        elif isinstance(item, (list, tuple)):
+            item = ", ".join(str(entry) for entry in item)
+        parts.append(f"{_FIELD_LABELS.get(key, key)}: {item}")
+    return " · ".join(parts) if parts else str(value)
+
+
+def format_health(value: Any) -> str:
+    return format_fields(value, ("status", "protocol", "runner_slots", "max_upload_bytes", "capabilities"))
+
+
+def format_job_status(value: Any) -> str:
+    return format_fields(value, ("id", "status", "error", "return_code", "result_bytes", "updated_utc"))
+
+
+def next_free_path(path: Path) -> Path:
+    """Return the path itself, or the next unused '-2', '-3'… sibling."""
+    if not path.exists():
+        return path
+    suffix = path.suffix if path.suffix[1:].isalnum() else ""
+    stem = path.name[: len(path.name) - len(suffix)]
+    index = 2
+    while (candidate := path.with_name(f"{stem}-{index}{suffix}")).exists():
+        index += 1
+    return candidate
+
+
+def restored_output_path(value: str) -> str:
+    """A restored output must still be a new path, so step past existing files."""
+    text = value.strip()
+    if not text:
+        return value
+    try:
+        return str(next_free_path(Path(text)))
+    except OSError:
+        return value
+
+
+def append_log(widget: tk.Text, message: Any) -> None:
+    """Append one line, keeping the view where a reading user left it."""
+    at_bottom = widget.yview()[1] >= 0.999
+    widget.configure(state="normal")
+    widget.insert("end", str(message).rstrip() + "\n")
+    if at_bottom:
+        widget.see("end")
+    widget.configure(state="disabled")
+
+
+def attach_log_menu(widget: tk.Text) -> tk.Menu:
+    """Give a read-only log the copy and save actions users expect on right click."""
+    menu = tk.Menu(widget, tearoff=0)
+
+    def copy() -> None:
+        try:
+            text = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            text = widget.get("1.0", "end-1c")
+        if not text:
+            return
+        widget.clipboard_clear()
+        widget.clipboard_append(text)
+
+    def save() -> None:
+        path = filedialog.asksaveasfilename(title="로그 저장", defaultextension=".txt",
+                                            filetypes=[("텍스트 파일", "*.txt"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        try:
+            Path(path).write_text(widget.get("1.0", "end-1c"), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"로그를 저장하지 못했습니다.\n{exc}")
+
+    menu.add_command(label="복사", command=copy)
+    menu.add_command(label="로그 저장…", command=save)
+
+    def popup(event: tk.Event) -> str:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    widget.bind("<Button-3>", popup, add="+")
+    widget.log_menu = menu  # keep the menu alive with its log widget
+    return menu
+
+
 def _target_row(parent, row, label, variable, command):
     ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
     entry = ttk.Entry(parent, textvariable=variable)
@@ -69,9 +211,7 @@ def _choose_targets(pane, source_var, kind):
         if pane._running or Path(source_var.get().strip()).resolve() != source or not pane.spd_loading.require_ready():
             messagebox.showerror(APP_NAME, "작업 상태 또는 SPD 파일이 바뀌었습니다. 목록을 다시 열어 주세요.", parent=pane)
             return
-        encoded = io.StringIO()
-        csv.writer(encoded, lineterminator="").writerow(values)
-        variable.set(encoded.getvalue())
+        variable.set(encode_target_values(values))
         if kind == "layers" and pane.nets_var.get().strip():
             pane._write_log("레이어 선택이 변경되었습니다. 대상 NET 목록도 확인해 주세요.")
 
@@ -136,7 +276,7 @@ def load_settings() -> dict[str, str]:
         return {}
 
 
-def save_settings(values: dict[str, str]) -> None:
+def save_settings(values: dict[str, str]) -> bool:
     """Persist only workstation addresses and paths; tokens are deliberately excluded."""
     safe = {key: value for key, value in values.items() if "token" not in key.lower()}
     path = settings_file()
@@ -146,7 +286,8 @@ def save_settings(values: dict[str, str]) -> None:
         merged.update(safe)
         path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
-        pass
+        return False
+    return True
 
 
 class ConverterApp(ttk.Frame):
@@ -208,6 +349,7 @@ class ConverterApp(ttk.Frame):
         self.log.configure(yscrollcommand=scroll.set)
         self.log.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
+        attach_log_menu(self.log)
         self._write_log("준비되었습니다. 입력 SPD와 출력 XML 경로를 지정한 뒤 변환을 시작하세요.")
 
     def _file_row(self, row: int, label: str, variable: tk.StringVar, command: Any, file_type: str) -> None:
@@ -301,7 +443,10 @@ class ConverterApp(ttk.Frame):
                     self._finish_error(*payload)
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+        except Exception as exc:  # a UI-side failure must never stop the pump
+            self._finish_error(str(exc), traceback.format_exc())
+        finally:
+            self.after(100, self._drain_events)
 
     def _finish_success(self, output: Path, report: Any) -> None:
         self._running = False
@@ -358,10 +503,7 @@ class ConverterApp(ttk.Frame):
             messagebox.showerror(APP_NAME, f"폴더를 열 수 없습니다.\n{exc}")
 
     def _write_log(self, message: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", message.rstrip() + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        append_log(self.log, message)
 
 
 class RemoteClientPane(ttk.Frame):
@@ -377,7 +519,7 @@ class RemoteClientPane(ttk.Frame):
         self.fingerprint_var = tk.StringVar(value=persisted.get("remote_fingerprint", ""))
         self.spd_var = tk.StringVar(value=persisted.get("remote_spd", ""))
         self.brd_var = tk.StringVar(value=persisted.get("remote_brd", ""))
-        self.output_var = tk.StringVar(value=persisted.get("remote_output", ""))
+        self.output_var = tk.StringVar(value=restored_output_path(persisted.get("remote_output", "")))
         self.job_var = tk.StringVar(value=persisted.get("remote_job_id", ""))
         self.layers_var = tk.StringVar(value=persisted.get("remote_layers", ""))
         self.nets_var = tk.StringVar(value=persisted.get("remote_nets", ""))
@@ -389,6 +531,7 @@ class RemoteClientPane(ttk.Frame):
         self._cancel_requested = False
         self._job_id = ""
         self._client: Any = None
+        self._last_result: Path | None = None
         self._checked_pid: tuple[tuple[str, int, str, int], int] | None = None
         self._build()
         self.pid_var.trace_add("write", self._update_pid_note)
@@ -400,9 +543,14 @@ class RemoteClientPane(ttk.Frame):
             ttk.Label(self, text="원격 Allegro 24.1 작업", font=("Malgun Gothic", 15, "bold")).grid(
                 row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
             )
-        self._row(2, "워크스테이션 IP", self.host_var)
+        self.host_entry = self._row(2, "워크스테이션 IP", self.host_var)
         self._row(3, "포트", self.port_var)
-        self._row(4, "접속 토큰", self.token_var, show="•")
+        ttk.Label(self, text="접속 토큰").grid(row=4, column=0, sticky="w", pady=3)
+        self.token_entry = ttk.Entry(self, textvariable=self.token_var, show="•")
+        self.token_entry.grid(row=4, column=1, sticky="ew", padx=10, pady=3)
+        self.show_token_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self, text="토큰 표시", variable=self.show_token_var,
+                        command=self._toggle_token).grid(row=4, column=2, sticky="e")
         self._row(5, "인증서 지문", self.fingerprint_var)
         ttk.Label(self, text="Allegro PID (빈칸: 새 실행)").grid(row=6, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.pid_var).grid(row=6, column=1, sticky="ew", padx=10, pady=3)
@@ -428,12 +576,14 @@ class RemoteClientPane(ttk.Frame):
         self.resume_button = ttk.Button(controls, text="기존 작업 받기", command=self._resume)
         self.resume_button.grid(row=0, column=2, padx=(0, 6))
         self.cancel_button = ttk.Button(controls, text="취소", command=self._cancel, state="disabled")
-        self.cancel_button.grid(row=0, column=3, padx=(0, 10))
-        ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=4, sticky="w")
+        self.cancel_button.grid(row=0, column=3, padx=(0, 6))
+        self.open_button = ttk.Button(controls, text="결과 폴더 열기", command=self._open_folder, state="disabled")
+        self.open_button.grid(row=0, column=4, padx=(0, 10))
+        ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=5, sticky="w")
         ttk.Label(self, text="원격 작업 로그").grid(row=16, column=0, columnspan=3, sticky="w")
         frame = ttk.Frame(self)
         frame.grid(row=17, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
-        self.rowconfigure(17, weight=1)
+        self.rowconfigure(17, weight=1, minsize=120)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         self.log = tk.Text(frame, height=7, wrap="word", state="disabled", font=("Consolas", 10))
@@ -441,10 +591,19 @@ class RemoteClientPane(ttk.Frame):
         self.log.configure(yscrollcommand=scrollbar.set)
         self.log.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
+        attach_log_menu(self.log)
+        # Start typing where a user always starts: the workstation address.
+        self.initial_focus = self.host_entry
+        self.initial_focus.focus_set()
 
-    def _row(self, row: int, label: str, variable: tk.StringVar, show: str | None = None) -> None:
+    def _row(self, row: int, label: str, variable: tk.StringVar, show: str | None = None) -> ttk.Entry:
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(self, textvariable=variable, show=show or "").grid(row=row, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+        entry = ttk.Entry(self, textvariable=variable, show=show or "")
+        entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+        return entry
+
+    def _toggle_token(self) -> None:
+        self.token_entry.configure(show="" if self.show_token_var.get() else "•")
 
     def _file_row(self, row: int, label: str, variable: tk.StringVar, command: Any, type_name: str, pattern: str) -> None:
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=3)
@@ -493,7 +652,9 @@ class RemoteClientPane(ttk.Frame):
 
         client = RemoteClient(host, port=port, token=token, fingerprint=fingerprint, timeout=30)
         result = client.check_pid(pid)
-        self._events.put(("pid_validated", (pid_identity_key(host, port, fingerprint, pid), result)))
+        # Validate here so a bad agent reply is reported as an ordinary worker error.
+        creation = checked_creation_time(result, pid)
+        self._events.put(("pid_validated", (pid_identity_key(host, port, fingerprint, pid), result, creation)))
 
     def _config(self) -> tuple[str, int, str, str]:
         host = self.host_var.get().strip()
@@ -568,7 +729,7 @@ class RemoteClientPane(ttk.Frame):
             if prior is not None and prior[0] == key:
                 options["allegro_creation_time"] = prior[1]
         options = {key: value for key, value in options.items() if value is not None}
-        self._start_worker(self._run_worker, host, port, token, fingerprint, source, base_brd, output, options, self.spd_loading.signature)
+        self._start_worker(self._run_worker, host, port, token, fingerprint, source, base_brd, output, options, self.spd_loading.signature, cancellable=True)
 
     @staticmethod
     def _items(value: str) -> list[str] | None:
@@ -591,7 +752,7 @@ class RemoteClientPane(ttk.Frame):
             messagebox.showerror(APP_NAME, "결과 ZIP은 새 파일 경로여야 합니다. 기존 파일을 다른 이름으로 지정하세요.")
             return
         self._cancel_requested = False
-        self._start_worker(self._resume_worker, host, port, token, fingerprint, job_id, output)
+        self._start_worker(self._resume_worker, host, port, token, fingerprint, job_id, output, cancellable=True)
 
     def _resume_worker(self, host: str, port: int, token: str, fingerprint: str, job_id: str, output: Path) -> None:
         from brd_spd.remote import RemoteClient
@@ -606,8 +767,7 @@ class RemoteClientPane(ttk.Frame):
 
         client = RemoteClient(host, port=port, token=token, fingerprint=fingerprint, timeout=30)
         self._client = client
-        self._events.put(("log", "워크스테이션 연결 확인"))
-        self._events.put(("log", str(client.health())))
+        self._events.put(("log", "워크스테이션 연결 확인: " + format_health(client.health())))
         if "allegro_pid" in options and "allegro_creation_time" not in options:
             pid = int(options["allegro_pid"])
             identity = client.check_pid(pid)
@@ -625,12 +785,13 @@ class RemoteClientPane(ttk.Frame):
             def upload_progress(value: Any) -> None:
                 if self._cancel_requested:
                     raise _UserCancelled("사용자가 업로드를 취소했습니다.")
-                self._events.put(("log", f"업로드: {value}"))
+                self._events.put(("log", format_transfer("업로드", value)))
 
             if self._cancel_requested:
                 raise _UserCancelled("사용자가 작업을 취소했습니다.")
             self._events.put(("log", "로딩한 SPD의 작업용 사본 준비"))
-            with source_snapshot(source, source_signature, output.parent, lambda: self._cancel_requested) as snapshot:
+            with source_snapshot(source, source_signature, output.parent, lambda: self._cancel_requested,
+                                 snapshot_progress(self._events)) as snapshot:
                 client.upload_file(job_id, "spd", snapshot, progress=upload_progress)
             if base_brd is not None:
                 client.upload_file(job_id, "brd", base_brd, progress=upload_progress)
@@ -668,19 +829,22 @@ class RemoteClientPane(ttk.Frame):
             self._events.put(("status", f"원격 작업: {state}"))
             if state in {"succeeded", "completed", "completed_with_warnings"}:
                 def download_progress(value: Any) -> None:
-                    self._events.put(("log", f"다운로드: {value}"))
+                    self._events.put(("log", format_transfer("다운로드", value)))
                 client.download_result(job_id, output, progress=download_progress)
                 self._events.put(("complete", (output, status)))
                 return
             if state in {"failed", "cancelled", "interrupted"}:
+                # A cancel the user asked for is not a failure, but its logs are still saved.
+                event = "cancelled" if state == "cancelled" else "failed_result"
+                label = "로그 ZIP 다운로드" if event == "cancelled" else "진단 ZIP 다운로드"
                 try:
                     def diagnostic_progress(value: Any) -> None:
-                        self._events.put(("log", f"진단 ZIP 다운로드: {value}"))
+                        self._events.put(("log", format_transfer(label, value)))
                     client.download_result(job_id, output, progress=diagnostic_progress)
-                    self._events.put(("failed_result", (output, status)))
+                    self._events.put((event, (output, status)))
                     return
                 except Exception as exc:
-                    self._events.put(("log", f"진단 ZIP을 받을 수 없습니다: {exc}"))
+                    self._events.put(("log", f"{label}에 실패했습니다: {exc}"))
                 raise RuntimeError(status.get("error") or f"원격 작업이 {state} 상태로 끝났습니다.")
             threading.Event().wait(1.0)
 
@@ -688,16 +852,18 @@ class RemoteClientPane(ttk.Frame):
         if self._running:
             self._cancel_requested = True
             self.status_var.set("취소 요청 중…")
-            self.cancel_button.configure(state="disabled")
+            # Stay enabled: a cancel may need repeating while the agent finishes.
+            self.cancel_button.configure(text="취소 재요청")
 
-    def _start_worker(self, target: Any, *args: Any) -> None:
+    def _start_worker(self, target: Any, *args: Any, cancellable: bool = False) -> None:
         self._running = True
         self.spd_loading.sync()
         self.connect_button.configure(state="disabled")
         self.run_button.configure(state="disabled")
         self.resume_button.configure(state="disabled")
         self.pid_check_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
+        # Only jobs with a cancel path may offer the button.
+        self.cancel_button.configure(state="normal" if cancellable else "disabled", text="취소")
         self.status_var.set("작업 중…")
         def runner() -> None:
             try:
@@ -714,8 +880,7 @@ class RemoteClientPane(ttk.Frame):
                 elif kind == "status": self.status_var.set(str(payload))
                 elif kind == "job": self.job_var.set(str(payload))
                 elif kind == "pid_validated":
-                    key, identity = payload
-                    creation = checked_creation_time(identity, key[3])
+                    key, identity, creation = payload
                     self._checked_pid = (key, creation)
                     executable = identity.get("executable", "")
                     pid = identity.get("pid", self.pid_var.get())
@@ -723,21 +888,23 @@ class RemoteClientPane(ttk.Frame):
                     self._finish("PID 확인됨")
                 elif kind == "connected":
                     self._client, health = payload
-                    self._write_log("연결 확인: " + str(health))
+                    self._write_log("연결 확인: " + format_health(health))
                     self._finish("연결됨")
                 elif kind == "complete":
                     output, status = payload
-                    self._write_log("완료: " + str(status))
-                    self._finish("완료")
+                    self._write_log("완료: " + format_job_status(status))
+                    self._finish("완료", result=output)
                     messagebox.showinfo(APP_NAME, f"원격 작업 결과를 저장했습니다.\n{output}")
                 elif kind == "failed_result":
                     output, status = payload
-                    self._write_log("실패 진단 ZIP 저장: " + str(status))
-                    self._finish("실패 진단 ZIP 저장됨")
+                    self._write_log("실패 진단 ZIP 저장: " + format_job_status(status))
+                    self._finish("실패 진단 ZIP 저장됨", result=output)
                     messagebox.showwarning(APP_NAME, f"원격 작업은 실패했지만 진단 ZIP을 저장했습니다.\n{output}")
                 elif kind == "cancelled":
-                    self._write_log("작업 취소됨")
-                    self._finish("취소됨")
+                    output, status = payload
+                    self._write_log("작업 취소 · 로그 ZIP 저장: " + format_job_status(status))
+                    self._finish("취소됨 (로그 ZIP 저장됨)", result=output)
+                    messagebox.showinfo(APP_NAME, f"작업을 취소했습니다. 로그 ZIP을 저장했습니다.\n{output}")
                 elif kind == "error":
                     message, details = payload
                     self._write_log("오류: " + message)
@@ -746,23 +913,45 @@ class RemoteClientPane(ttk.Frame):
                     messagebox.showerror(APP_NAME, f"원격 작업에 실패했습니다.\n\n{message}")
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+        except Exception as exc:  # a UI-side failure must never stop the pump
+            self._write_log("오류: " + str(exc))
+            self._write_log(traceback.format_exc())
+            self._finish("오류")
+            messagebox.showerror(APP_NAME, f"원격 작업에 실패했습니다.\n\n{exc}")
+        finally:
+            self.after(100, self._drain_events)
 
-    def _finish(self, status: str) -> None:
+    def _finish(self, status: str, *, result: Path | None = None) -> None:
         self._running = False
         self.connect_button.configure(state="normal")
         self.spd_loading.sync()
         self.resume_button.configure(state="normal")
         self.pid_check_button.configure(state="normal")
-        self.cancel_button.configure(state="disabled")
+        self.cancel_button.configure(state="disabled", text="취소")
+        if result is not None:
+            self._last_result = result
+            self.open_button.configure(state="normal")
         self.status_var.set(status)
-        save_settings({"remote_host": self.host_var.get(), "remote_port": self.port_var.get(), "remote_fingerprint": self.fingerprint_var.get(), "remote_spd": self.spd_var.get(), "remote_brd": self.brd_var.get(), "remote_output": self.output_var.get(), "remote_job_id": self.job_var.get(), "remote_layers": self.layers_var.get(), "remote_nets": self.nets_var.get()})
+        if not save_settings({"remote_host": self.host_var.get(), "remote_port": self.port_var.get(), "remote_fingerprint": self.fingerprint_var.get(), "remote_spd": self.spd_var.get(), "remote_brd": self.brd_var.get(), "remote_output": self.output_var.get(), "remote_job_id": self.job_var.get(), "remote_layers": self.layers_var.get(), "remote_nets": self.nets_var.get()}):
+            self._write_log(f"설정을 저장하지 못했습니다: {settings_file()}")
+
+    def _open_folder(self) -> None:
+        target = (self._last_result or Path(self.output_var.get().strip() or ".")).parent
+        if not target.is_dir():
+            messagebox.showerror(APP_NAME, f"결과 폴더를 찾을 수 없습니다.\n{target}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(target)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(target)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(target)], check=False)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"폴더를 열 수 없습니다.\n{exc}")
 
     def _write_log(self, message: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", message.rstrip() + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        append_log(self.log, message)
 
 
 class SkillPane(ttk.Frame):
@@ -772,19 +961,19 @@ class SkillPane(ttk.Frame):
         super().__init__(master, padding=16)
         persisted = load_settings()
         self.source_var = tk.StringVar(value=persisted.get("skill_spd", ""))
-        self.output_var = tk.StringVar(value=persisted.get("skill_output", ""))
+        self.output_var = tk.StringVar(value=restored_output_path(persisted.get("skill_output", "")))
         self.layers_var = tk.StringVar(value=persisted.get("skill_layers", ""))
         self.nets_var = tk.StringVar(value=persisted.get("skill_nets", ""))
         self.components_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="SPD 파일과 출력 폴더를 지정하세요.")
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._running = False
+        self._cancel_requested = False
         self._build()
         self.after(100, self._drain_events)
 
     def _build(self) -> None:
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(7, weight=1)
         ttk.Label(self, text="Native import SKILL 생성", font=("Malgun Gothic", 15, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Label(self, text="SKILL은 라이선스가 있는 Allegro 워크스테이션에서 검토 후 실행합니다. 원본 BRD의 규칙·배선·동적 plane 자동 복원은 범위에 포함되지 않습니다.", foreground="#8a4b00", wraplength=720).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
         self.spd_loading = SpdLoading(self, self.source_var, 2, self._choose_source)
@@ -798,12 +987,14 @@ class SkillPane(ttk.Frame):
         self.generate_button = ttk.Button(controls, text="SKILL 번들 생성", command=self._generate)
         self.generate_button.grid(row=0, column=0, padx=(0, 8))
         self.spd_loading.bind_controls(targets + [self.components_check, self.generate_button])
+        self.cancel_button = ttk.Button(controls, text="취소", command=self._cancel, state="disabled")
+        self.cancel_button.grid(row=0, column=1, padx=(0, 8))
         self.open_button = ttk.Button(controls, text="출력 폴더 열기", command=self._open_folder, state="disabled")
-        self.open_button.grid(row=0, column=1)
-        ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=2, sticky="w", padx=12)
+        self.open_button.grid(row=0, column=2)
+        ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=3, sticky="w", padx=12)
         frame = ttk.Frame(self)
         frame.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
-        self.rowconfigure(8, weight=1)
+        self.rowconfigure(8, weight=1, minsize=120)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         self.log = tk.Text(frame, height=13, wrap="word", state="disabled", font=("Consolas", 10))
@@ -811,6 +1002,7 @@ class SkillPane(ttk.Frame):
         self.log.configure(yscrollcommand=scroll.set)
         self.log.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
+        attach_log_menu(self.log)
 
     def _entry_row(self, row: int, label: str, variable: tk.StringVar) -> None:
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=3)
@@ -834,13 +1026,7 @@ class SkillPane(ttk.Frame):
         path = filedialog.askdirectory(title="새 SKILL 번들을 만들 상위 폴더 선택")
         if path:
             source_name = Path(self.source_var.get().strip() or "spd").stem
-            parent = Path(path)
-            candidate = parent / f"{source_name}-skill-bundle"
-            suffix = 2
-            while candidate.exists():
-                candidate = parent / f"{source_name}-skill-bundle-{suffix}"
-                suffix += 1
-            self.output_var.set(str(candidate))
+            self.output_var.set(str(next_free_path(Path(path) / f"{source_name}-skill-bundle")))
 
     @staticmethod
     def _items(value: str) -> list[str] | None:
@@ -866,8 +1052,10 @@ class SkillPane(ttk.Frame):
         update_components = self.components_var.get()
         source_signature = self.spd_loading.signature
         self._running = True
+        self._cancel_requested = False
         self.spd_loading.sync()
         self.open_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal", text="취소")
         self.status_var.set("SKILL 생성 중…")
         def worker() -> None:
             try:
@@ -877,12 +1065,23 @@ class SkillPane(ttk.Frame):
                     self._events.put(("log", str(message)))
                 output.parent.mkdir(parents=True, exist_ok=True)
                 progress("로딩한 SPD의 작업용 사본 준비")
-                with source_snapshot(source, source_signature, output.parent) as snapshot:
+                with source_snapshot(source, source_signature, output.parent,
+                                     lambda: self._cancel_requested,
+                                     snapshot_progress(self._events)) as snapshot:
                     report = generate_bundle(snapshot, output, layers=layers, nets=nets, update_components=update_components, progress=progress)
                 self._events.put(("complete", (output, report)))
+            except CancelledError:
+                self._events.put(("cancelled", None))
             except Exception as exc:
                 self._events.put(("error", (str(exc), traceback.format_exc())))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _cancel(self) -> None:
+        if self._running:
+            self._cancel_requested = True
+            self.status_var.set("취소 요청 중…")
+            # Stay enabled: the copy only stops at its next chunk boundary.
+            self.cancel_button.configure(text="취소 재요청")
 
     def _drain_events(self) -> None:
         try:
@@ -893,8 +1092,11 @@ class SkillPane(ttk.Frame):
                 elif kind == "complete":
                     output, report = payload
                     self._write_log("완료: " + str(report))
-                    self._finish("완료")
+                    self._finish("완료", success=True)
                     messagebox.showinfo(APP_NAME, f"SKILL 번들이 생성되었습니다.\n{output}")
+                elif kind == "cancelled":
+                    self._write_log("작업을 취소했습니다.")
+                    self._finish("취소됨")
                 elif kind == "error":
                     message, details = payload
                     self._write_log("오류: " + message)
@@ -903,14 +1105,23 @@ class SkillPane(ttk.Frame):
                     messagebox.showerror(APP_NAME, f"SKILL 생성에 실패했습니다.\n\n{message}")
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+        except Exception as exc:  # a UI-side failure must never stop the pump
+            self._write_log("오류: " + str(exc))
+            self._write_log(traceback.format_exc())
+            self._finish("오류")
+            messagebox.showerror(APP_NAME, f"SKILL 생성에 실패했습니다.\n\n{exc}")
+        finally:
+            self.after(100, self._drain_events)
 
-    def _finish(self, status: str) -> None:
+    def _finish(self, status: str, *, success: bool = False) -> None:
         self._running = False
         self.spd_loading.sync()
-        self.open_button.configure(state="normal")
+        self.cancel_button.configure(state="disabled", text="취소")
+        if success:
+            self.open_button.configure(state="normal")
         self.status_var.set(status)
-        save_settings({"skill_spd": self.source_var.get(), "skill_output": self.output_var.get(), "skill_layers": self.layers_var.get(), "skill_nets": self.nets_var.get()})
+        if not save_settings({"skill_spd": self.source_var.get(), "skill_output": self.output_var.get(), "skill_layers": self.layers_var.get(), "skill_nets": self.nets_var.get()}):
+            self._write_log(f"설정을 저장하지 못했습니다: {settings_file()}")
 
     def _open_folder(self) -> None:
         path = Path(self.output_var.get().strip())
@@ -926,10 +1137,7 @@ class SkillPane(ttk.Frame):
             messagebox.showerror(APP_NAME, f"폴더를 열 수 없습니다.\n{exc}")
 
     def _write_log(self, message: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", message.rstrip() + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        append_log(self.log, message)
 
 
 class RemoteWorkPane(ttk.Frame):
@@ -992,7 +1200,8 @@ class RemoteWorkPane(ttk.Frame):
             return
         self.role = selected
         self._show_role()
-        save_settings({"remote_role": self.role})
+        if not save_settings({"remote_role": self.role}):
+            self.client._write_log(f"설정을 저장하지 못했습니다: {settings_file()}")
         self.event_generate("<<RemoteRoleChanged>>")
 
     def _show_role(self) -> None:
@@ -1025,6 +1234,7 @@ class DesktopApp(ttk.Frame):
         super().__init__(master)
         master.title(APP_NAME)
         master.minsize(760, 660)
+        master.geometry("900x760")
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
         self.grid(sticky="nsew")
@@ -1032,38 +1242,53 @@ class DesktopApp(ttk.Frame):
         self.rowconfigure(0, weight=1)
         notebook = self.notebook = ttk.Notebook(self)
         notebook.grid(sticky="nsew")
-        ipc = ttk.Frame(notebook)
-        ipc.columnconfigure(0, weight=1)
-        ipc.rowconfigure(0, weight=1)
         if IPC_CONVERSION_ENABLED:
+            ipc = ttk.Frame(notebook)
+            ipc.columnconfigure(0, weight=1)
+            ipc.rowconfigure(0, weight=1)
             ConverterApp(ipc).grid(row=0, column=0, sticky="nsew")
-        else:
-            ttk.Label(ipc, text="IPC-2581 변환은 현재 비활성화되어 있습니다.").grid(padx=24, pady=24)
         skill = self.skill = SkillPane(notebook)
         remote = self.remote = RemoteWorkPane(notebook, skill)
-        notebook.add(ipc, text="IPC-2581 변환" if IPC_CONVERSION_ENABLED else "IPC-2581 변환 (비활성)",
-                     state="normal" if IPC_CONVERSION_ENABLED else "disabled")
+        # A permanently disabled tab only adds noise, so it is left out entirely.
+        if IPC_CONVERSION_ENABLED:
+            notebook.add(ipc, text="IPC-2581 변환")
         notebook.add(skill, text="Native SKILL 생성")
         notebook.add(remote, text="원격 Allegro 작업")
         notebook.select(remote)
         remote.bind("<<RemoteRoleChanged>>", self._role_changed)
         self._role_changed()
-        self._menu, self._help_menu = install_help_menu(
-            master, lambda: remote.help_topic()
-            if notebook.select() == str(remote) else "native-skill"
-        )
+        self._menu, self._help_menu = install_help_menu(master, self._help_topic)
         master.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _help_topic(self) -> str:
+        selected = self.notebook.select()
+        if selected == str(self.remote):
+            return self.remote.help_topic()
+        if selected == str(self.skill):
+            return "native-skill"
+        return "overview"
 
     def _role_changed(self, _event: Any = None) -> None:
         self.notebook.tab(self.skill, state="disabled" if self.remote.role == "workstation" else "normal")
 
     def _on_close(self) -> None:
         if self.remote.agent is not None and not self.remote.agent.can_switch_role:
+            # The agent owns Allegro sessions, so it stops itself and then closes.
             self.remote.agent._on_close()
-        elif self.remote._busy_reason():
-            messagebox.showinfo(APP_NAME, "진행 중인 작업을 완료하거나 취소한 뒤 프로그램을 닫으세요.", parent=self)
-        else:
-            self.master.destroy()
+            return
+        if self.remote._busy_reason():
+            if not messagebox.askyesno(APP_NAME, "진행 중인 작업이 있습니다. 취소를 요청하고 프로그램을 닫을까요?", parent=self):
+                return
+            self._request_cancel()
+        self.master.destroy()
+
+    def _request_cancel(self) -> None:
+        """Ask every busy pane to stop; its worker threads are daemons."""
+        for pane in (self.remote.client, self.skill):
+            if pane._running:
+                pane._cancel()
+            pane.spd_loading.cancel.set()
+            pane.spd_loading.loading = False
 
 
 def main() -> None:

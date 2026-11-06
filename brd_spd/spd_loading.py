@@ -21,12 +21,14 @@ class SpdLoading:
         self.events = queue.Queue()
         self.timer = None
         self.controls = []
+        self.restore = ("", "", False)
         ttk.Label(pane, text="SPD 입력").grid(row=row, column=0, sticky="w")
         field = ttk.Frame(pane)
         field.grid(row=row, column=1, sticky="ew", padx=10, pady=3)
         field.columnconfigure(0, weight=1)
         self.entry = ttk.Entry(field, textvariable=variable)
         self.entry.grid(sticky="ew")
+        self.entry.bind("<Return>", self._load_event, add="+")
         self.status = tk.StringVar(value="SPD를 불러오면 대상과 작업 옵션이 활성화됩니다.")
         ttk.Label(field, textvariable=self.status, wraplength=430).grid(sticky="w")
         buttons = ttk.Frame(pane)
@@ -61,9 +63,15 @@ class SpdLoading:
         self.status.set("SPD 불러오기가 필요합니다. 이전 대상 선택은 초기화되었습니다.")
         self.sync()
 
+    def _load_event(self, _event):
+        self.load()
+        return "break"
+
     def load(self):
         if self.pane._running or self.loading:
             return
+        # Keep the current selection so a reload of the same board can restore it.
+        self.restore = (self.pane.layers_var.get(), self.pane.nets_var.get(), self.pane.components_var.get())
         self.invalidate()
         try:
             if not self.variable.get().strip():
@@ -118,11 +126,35 @@ class SpdLoading:
                     text = f"SPD 로딩 완료 · 레이어 {len(catalog['layers'])}개 · NET {len(catalog['nets'])}개"
                     self.status.set(text)
                     self.pane._write_log(text)
+                    self._restore_targets(catalog)
                     self.sync()
         except queue.Empty:
             pass
         if self.loading:
             self.timer = self.pane.after(75, self._drain)
+
+    def _restore_targets(self, catalog):
+        """Bring back the selection cleared by ``invalidate`` for names this SPD still has."""
+        from .gui import encode_target_values, parse_target_values
+
+        layers_text, nets_text, components = self.restore
+        self.restore = ("", "", False)
+        for variable, text, known in ((self.pane.layers_var, layers_text, catalog["layers"]),
+                                      (self.pane.nets_var, nets_text, catalog["nets"])):
+            try:
+                names = parse_target_values(text)
+            except ValueError:
+                names = None
+            if not names:
+                continue
+            available = set(known)
+            kept = [name for name in names if name in available]
+            dropped = [name for name in names if name not in available]
+            if kept:
+                variable.set(encode_target_values(kept))
+            if dropped:
+                self.pane._write_log("이번 SPD에 없는 대상은 제외했습니다: " + ", ".join(dropped))
+        self.pane.components_var.set(bool(components))
 
     def _failed(self, text):
         self.loading = False

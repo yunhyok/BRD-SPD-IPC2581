@@ -29,6 +29,7 @@
 |---|---|
 | `BOARD_OUTLINE_UNAVAILABLE` | 유효한 보드 외곽선 없음; copper bounding box로 대체하지 않음 |
 | `SIGNED_VOID_FALLBACK` / `INVALID_PLANE_TOPOLOGY` | void 포함 관계/자기 교차를 확인해야 함 |
+| `SHAPE_POLARITY_ASSUMED` | Shape 레코드에 `+`/`-` 부호가 없어 양극으로 간주함. 부호가 이름의 일부인 net(`USB_D-` 등)은 부호를 극성과 구분할 수 없으므로, 그런 net이 Node/Trace/Via 목록에 실제로 존재하면 변환을 중단함. 반대로 `VCC-` 같은 이름이 Shape 레코드에만 있고 Node/Trace/Via에는 없으면 대조할 근거가 없어 net `VCC`의 음극 도형으로 읽습니다 |
 | `NODE_PAD_NOT_DEFINED` / `PACKAGE_PIN_WITHOUT_PAD` | 지정된 층의 pad 정의가 없어 해당 도형 누락 |
 | `TRACE_ATTRIBUTES_NOT_EXPORTED` | 기본 직선/고정 폭 이외의 속성을 출력하지 않음 |
 | `VIA_DRILL_APPROXIMATION` | finished drill과 barrel radius가 같은지 확인 필요 |

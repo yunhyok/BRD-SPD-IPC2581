@@ -24,6 +24,44 @@ class HelpLinks(HTMLParser):
             self.resources.append(attrs.get("src", attrs.get("href", "")))
 
 
+class HelpStructure(HTMLParser):
+    """Capture the <nav> anchor order and each <section>'s <h2> heading text."""
+
+    def __init__(self):
+        super().__init__()
+        self.nav_order = []
+        self.headings = {}
+        self._in_nav = False
+        self._section_stack = []
+        self._collecting_heading = False
+        self._heading_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "nav":
+            self._in_nav = True
+        elif tag == "a" and self._in_nav and attrs.get("href", "").startswith("#"):
+            self.nav_order.append(attrs["href"][1:])
+        elif tag == "section" and "id" in attrs:
+            self._section_stack.append(attrs["id"])
+        elif tag == "h2" and self._section_stack:
+            self._collecting_heading = True
+            self._heading_parts = []
+
+    def handle_endtag(self, tag):
+        if tag == "nav":
+            self._in_nav = False
+        elif tag == "h2" and self._collecting_heading:
+            self._collecting_heading = False
+            self.headings[self._section_stack[-1]] = "".join(self._heading_parts).strip()
+        elif tag == "section" and self._section_stack:
+            self._section_stack.pop()
+
+    def handle_data(self, data):
+        if self._collecting_heading:
+            self._heading_parts.append(data)
+
+
 def test_offline_help_has_all_menu_and_internal_targets():
     document = HelpLinks()
     document.feed(help_ui.help_file().read_text(encoding="utf-8"))
@@ -31,6 +69,17 @@ def test_offline_help_has_all_menu_and_internal_targets():
     assert all(target in document.ids for target in document.targets)
     assert not any(url.startswith(("http:", "https:", "//")) for url in document.resources)
     assert help_ui.help_url("target-selection").endswith("#target-selection")
+
+
+def test_help_topics_match_document_nav_order_and_headings():
+    structure = HelpStructure()
+    structure.feed(help_ui.help_file().read_text(encoding="utf-8"))
+    # HELP_TOPICS must walk the document's <nav> in the same order...
+    assert [anchor for _label, anchor in help_ui.HELP_TOPICS] == structure.nav_order
+    # ...and each combobox label must equal that section's heading text.
+    for label, anchor in help_ui.HELP_TOPICS:
+        assert anchor in structure.headings, f"no <h2> heading found for #{anchor}"
+        assert label == structure.headings[anchor]
 
 
 def test_frozen_help_prefers_installed_copy_and_falls_back_to_bundle(tmp_path, monkeypatch):

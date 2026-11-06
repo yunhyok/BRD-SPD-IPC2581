@@ -5,6 +5,7 @@ import pytest
 from lxml import etree
 
 from brd_spd.reference import IPC_2581_NAMESPACE, normalized_reference, read_reference
+from brd_spd.report import Report
 
 
 def _reference_xml(units="MICRON", tail=b"</LayerFeature></Step></CadData></Ecad></IPC-2581>"):
@@ -99,6 +100,42 @@ def test_recovers_mislabeled_cp949_reference(tmp_path: Path):
     assert "\ucd5c\uc724\ud601".encode("utf-8") in result["logistic_header"]
     assert result["encoding"] == "cp949"
     assert any("CP949" in warning for warning in result["warnings"])
+
+
+def test_recovers_cp949_reference_without_declaration(tmp_path: Path):
+    source = tmp_path / "undeclared.xml"
+    xml = _reference_xml().replace(b'<?xml version="1.0" encoding="UTF-8"?>\n', b"")
+    xml = xml.replace(b'name="P"', 'name="\ucd5c\uc724\ud601"'.encode("cp949"))
+    source.write_bytes(xml)
+
+    result = read_reference(source)
+
+    assert "\ucd5c\uc724\ud601".encode("utf-8") in result["logistic_header"]
+    assert result["encoding"] == "cp949"
+
+
+def test_structural_error_is_not_retried_as_cp949(tmp_path: Path):
+    source = tmp_path / "broken.xml"
+    source.write_bytes(_reference_xml().replace(b'<Content roleRef="Owner">', b'<Content roleRef="Owner"'))
+    with pytest.raises(etree.XMLSyntaxError):
+        read_reference(source)
+
+
+def test_reference_findings_reach_the_conversion_report(tmp_path: Path):
+    source = tmp_path / "cp949.xml"
+    xml = _reference_xml().replace(b'name="P"', 'name="\ucd5c\uc724\ud601"'.encode("cp949"))
+    source.write_bytes(xml)
+    report = Report(tmp_path / "result.xml")
+
+    read_reference(source, report)
+
+    inventory = report.data["info"]["REFERENCE_INVENTORY"]["samples"][0]
+    assert inventory["layers"] == 1 and inventory["units"] == "MICRON"
+    metadata = report.warnings["REFERENCE_METADATA_ONLY"]["samples"]
+    assert any("CP949" in sample["message"] and sample["reference"] for sample in metadata)
+    saved = report.save("success")
+    assert "REFERENCE_INVENTORY" in saved["info"]
+    assert "[REFERENCE_INVENTORY]" in (tmp_path / "result.xml.log").read_text(encoding="utf-8")
 
 
 def test_rejects_multiple_steps_before_geometry(tmp_path: Path):

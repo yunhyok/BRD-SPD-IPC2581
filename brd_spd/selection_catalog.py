@@ -55,7 +55,7 @@ def scan_catalog(
 
     conductor_order: list[str] = []
     conductor_seen: set[str] = set()
-    shape_layers: dict[str, str] = {}
+    shape_layers: dict[str, list[str]] = {}
     positive_nets: dict[str, set[str]] = {}
     shape_section: str | None = None
     pending: str | None = None
@@ -88,7 +88,10 @@ def scan_catalog(
                 shape_values = attrs["shape"].split()
                 layer_values = attrs["layer"].split()
                 if shape_values and layer_values:
-                    shape_layers[shape_values[0]] = layer_values[0]
+                    # A section can be patched onto several layers; keep them all.
+                    patched = shape_layers.setdefault(shape_values[0], [])
+                    if layer_values[0] not in patched:
+                        patched.append(layer_values[0])
             return
         if record.startswith(("Signal", "Plane", "Medium")) and "=" in record:
             fields = record.split(None, 1)
@@ -151,6 +154,10 @@ def scan_catalog(
                     f"line {line_number}: SPD is not valid UTF-8 "
                     f"(byte offset {exc.start} within the line)"
                 ) from exc
+            if line_number == 1 and text.startswith("﻿"):
+                # utf-8-sig semantics, exactly as the parser does it, so the
+                # catalog and the bundle never disagree about the first record.
+                text = text[1:]
 
             continuation = text.lstrip().startswith("+")
             if shape_section is not None:
@@ -196,9 +203,10 @@ def scan_catalog(
         raise RuntimeError("SPD source changed during catalog scan")
 
     nets_for_original: dict[str, set[str]] = {}
-    for section, layer in shape_layers.items():
-        if layer in conductor_seen and positive_nets.get(section):
-            nets_for_original.setdefault(layer, set()).update(positive_nets[section])
+    for section, section_layers in shape_layers.items():
+        for layer in section_layers:
+            if layer in conductor_seen and positive_nets.get(section):
+                nets_for_original.setdefault(layer, set()).update(positive_nets[section])
 
     layers: list[str] = []
     layer_seen: set[str] = set()

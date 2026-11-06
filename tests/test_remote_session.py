@@ -118,7 +118,8 @@ class SessionAgent(WorkstationAgent):
 
 
 def _start_session(tmp_path, mode="success", fail_identity_check=None,
-                   identity_failure=None, session_timeout_seconds=None):
+                   identity_failure=None, session_timeout_seconds=None,
+                   agent_type=None):
     executable = tmp_path / "allegro.exe"
     executable.touch()
     config = {
@@ -126,7 +127,7 @@ def _start_session(tmp_path, mode="success", fail_identity_check=None,
     }
     if session_timeout_seconds is not None:
         config["session_timeout_seconds"] = session_timeout_seconds
-    agent = SessionAgent(
+    agent = (agent_type or SessionAgent)(
         AgentConfig(tmp_path / "agent", **config),
         mode=mode,
         fail_identity_check=fail_identity_check,
@@ -478,4 +479,51 @@ def test_download_rejects_stale_archive_during_late_result_refresh(tmp_path, mon
         release.set()
         if thread is not None:
             thread.join(5)
+        agent.stop()
+
+
+class WindowCheckAgent(SessionAgent):
+    """Runs the real pre-dispatch window checks against the fake Windows API."""
+
+    eligible_windows: list = []
+
+    def _dispatch_session(self, state, command):
+        from brd_spd import process_target
+        from tests.test_process_target import FakeProcessAPI, FakeWindowAPI
+
+        self.commands.append((state, command))
+        process_api = FakeProcessAPI(
+            self._allegro_executable(), creation_time=self.identity["creation_time"]
+        )
+        window_api = FakeWindowAPI(list(self.eligible_windows), process_api)
+        return process_target._dispatch_command_windows(
+            self.pid, self._allegro_executable(), self.identity, command,
+            process_api=process_api, window_api=window_api,
+        )
+
+
+@pytest.mark.parametrize("candidates,fragment", [
+    ([], "no eligible Allegro window"),
+    ([{"hwnd": 21, "pid": SessionAgent.pid, "visible": True, "owner": 0, "title": "Allegro A"},
+      {"hwnd": 22, "pid": SessionAgent.pid, "visible": True, "owner": 0, "title": "Allegro B"}],
+     "multiple eligible Allegro windows"),
+])
+def test_dispatch_that_never_sent_a_command_fails_without_native_pending(
+        tmp_path, candidates, fragment):
+    agent, client = _start_session(tmp_path, agent_type=WindowCheckAgent)
+    agent.eligible_windows = candidates
+    try:
+        job = _session_job(client, tmp_path)
+        client.submit_job(job["id"])
+        failed = _wait(client, job["id"], {"failed"})
+        assert fragment in failed["error"]
+        assert failed["native_pending"] is False
+        assert failed["session_dispatched"] is False
+        bundle = agent._job_dir(job["id"]) / "bundle"
+        assert not (bundle / "cancel.flag").exists()
+        archive = client.download_result(job["id"], tmp_path / "not-attempted.zip")
+        with zipfile.ZipFile(archive) as result:
+            assert "result.brd" not in result.namelist()
+            assert json.loads(result.read("job.json"))["status"] == "failed"
+    finally:
         agent.stop()

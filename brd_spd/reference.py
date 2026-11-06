@@ -94,6 +94,25 @@ def _declared_encoding(path: Path) -> str | None:
     return match.group(1).decode("ascii", "replace") if match else None
 
 
+def _looks_like_mislabeled_cp949(path: Path) -> bool:
+    """True when the file claims UTF-8 but its bytes only decode as CP949."""
+    declared = (_declared_encoding(path) or "UTF-8").upper().replace("_", "-")
+    if declared not in {"UTF-8", "UTF8"}:
+        return False
+    raw = path.read_bytes()
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    else:
+        return False
+    try:
+        raw.decode("cp949")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def _component(element: etree._Element) -> dict[str, Any]:
     attrs = dict(element.attrib)
     xform = _child(element, "Xform")
@@ -304,11 +323,12 @@ def read_reference(path: Path, report: Any = None,
     try:
         result = _read_once(source, None, progress)
     except etree.XMLSyntaxError as exc:
-        declared = (_declared_encoding(source) or "").upper().replace("_", "-")
-        message = str(exc).lower()
-        if declared not in {"UTF-8", "UTF8"} or "utf-8" not in message:
+        # Some Cadence exports declare UTF-8 (or omit the declaration, which
+        # the XML specification treats as UTF-8) but contain Windows Korean
+        # text.  libxml2 reports this with version-specific wording, so the
+        # decision is made from the bytes rather than the error message.
+        if not _looks_like_mislabeled_cp949(source):
             raise
-        # Some Cadence exports declare UTF-8 but contain Windows Korean text.
         # Reparse with CP949 while preserving all XML text as UTF-8 on output.
         result = _read_once(source, "cp949", progress)
         result["warnings"].append(

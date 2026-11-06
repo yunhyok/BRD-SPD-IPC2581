@@ -11,7 +11,7 @@ from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .gui import APP_NAME, load_settings, save_settings
+from .gui import APP_NAME, append_log, attach_log_menu, load_settings, save_settings, settings_file
 from .help_ui import install_help_menu
 
 
@@ -33,6 +33,8 @@ class AgentConsoleApp(ttk.Frame):
         self.status_var = tk.StringVar(value="중지됨")
         self.token_var = tk.StringVar(value="")
         self.fingerprint_var = tk.StringVar(value="")
+        self._running_label = ""
+        self._status_ticks = 0
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._agent: Any = None
         self._busy = False
@@ -51,6 +53,22 @@ class AgentConsoleApp(ttk.Frame):
     def can_switch_role(self) -> bool:
         """Whether an embedding container may safely discard this idle pane."""
         return not self._busy and self._agent is None and not self._closing
+
+    @property
+    def running_jobs(self) -> int:
+        """Count the agent's unfinished jobs; an older agent may not report them."""
+        try:
+            return len(list(getattr(self._agent, "running_job_ids", None) or []))
+        except Exception:  # a status read must never break the console
+            return 0
+
+    def confirm_interrupt(self, question: str) -> bool:
+        """Ask before an action which would abort jobs the workstation is running."""
+        count = self.running_jobs
+        if not count:
+            return True
+        return bool(messagebox.askyesno(
+            APP_NAME, f"실행 중인 작업 {count}개가 중단됩니다. {question}", parent=self))
 
     def _configure_standalone(self, master: tk.Misc) -> None:
         master.title(f"{APP_NAME} Workstation Agent")
@@ -75,16 +93,20 @@ class AgentConsoleApp(ttk.Frame):
         controls.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 8))
         self.start_button = ttk.Button(controls, text="Agent 시작", command=self._start)
         self.start_button.grid(row=0, column=0, padx=(0, 6))
-        self.stop_button = ttk.Button(controls, text="Agent 중지", command=self._stop, state="disabled")
+        self.stop_button = ttk.Button(controls, text="Agent 중지", command=self._stop_clicked, state="disabled")
         self.stop_button.grid(row=0, column=1, padx=(0, 12))
         ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=2, sticky="w")
         ttk.Label(self, text="토큰 (클라이언트에 복사, 저장되지 않음)").grid(row=8, column=0, sticky="w", pady=3)
-        ttk.Entry(self, textvariable=self.token_var, state="readonly").grid(row=8, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+        ttk.Entry(self, textvariable=self.token_var, state="readonly").grid(row=8, column=1, sticky="ew", padx=(10, 0), pady=3)
+        self.token_copy_button = ttk.Button(self, text="복사", command=lambda: self._copy(self.token_var, "토큰"))
+        self.token_copy_button.grid(row=8, column=2, sticky="e", padx=(6, 0))
         ttk.Label(self, text="인증서 지문").grid(row=9, column=0, sticky="w", pady=3)
-        ttk.Entry(self, textvariable=self.fingerprint_var, state="readonly").grid(row=9, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=3)
+        ttk.Entry(self, textvariable=self.fingerprint_var, state="readonly").grid(row=9, column=1, sticky="ew", padx=(10, 0), pady=3)
+        self.fingerprint_copy_button = ttk.Button(self, text="복사", command=lambda: self._copy(self.fingerprint_var, "인증서 지문"))
+        self.fingerprint_copy_button.grid(row=9, column=2, sticky="e", padx=(6, 0))
         frame = ttk.Frame(self)
         frame.grid(row=10, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
-        self.rowconfigure(10, weight=1)
+        self.rowconfigure(10, weight=1, minsize=120)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         self.log = tk.Text(frame, height=11, wrap="word", state="disabled", font=("Consolas", 10))
@@ -92,6 +114,16 @@ class AgentConsoleApp(ttk.Frame):
         self.log.configure(yscrollcommand=scroll.set)
         self.log.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
+        attach_log_menu(self.log)
+
+    def _copy(self, variable: tk.StringVar, label: str) -> None:
+        value = variable.get().strip()
+        if not value:
+            messagebox.showinfo(APP_NAME, f"복사할 {label}이 없습니다. 먼저 Agent를 시작하세요.", parent=self)
+            return
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self._write_log(f"{label}을 클립보드에 복사했습니다.")
 
     def _row(self, row: int, label: str, variable: tk.StringVar) -> None:
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=3)
@@ -158,6 +190,13 @@ class AgentConsoleApp(ttk.Frame):
                 self._events.put(("error", ("start", str(exc), traceback.format_exc())))
         threading.Thread(target=worker, daemon=True).start()
 
+    def _stop_clicked(self) -> None:
+        if self._agent is None or self._busy:
+            return
+        if not self.confirm_interrupt("Agent를 중지할까요?"):
+            return
+        self._stop()
+
     def _stop(self, closing: bool = False) -> None:
         self._closing = self._closing or closing
         if self._agent is None or self._busy:
@@ -176,6 +215,8 @@ class AgentConsoleApp(ttk.Frame):
 
     def _on_close(self) -> None:
         """Stop the agent first so closing the GUI cannot orphan an Allegro process."""
+        if not self._closing and not self.confirm_interrupt("프로그램을 닫을까요?"):
+            return
         self._closing = True
         self.status_var.set("종료 중: Agent를 안전하게 중지합니다…")
         self._sync_controls()
@@ -208,8 +249,10 @@ class AgentConsoleApp(ttk.Frame):
                     self.token_var.set(str(info.get("token", "")))
                     self.fingerprint_var.set(str(info.get("fingerprint", "")))
                     self._write_log("Agent 시작: " + str(info))
-                    self.status_var.set(f"실행 중: {info.get('host')}:{info.get('port')}")
-                    save_settings({"agent_host": self.host_var.get(), "agent_port": self.port_var.get(), "agent_allowed_clients": self.allowed_var.get(), "agent_allegro_exe": self.exe_var.get(), "agent_workdir": self.workdir_var.get()})
+                    self._running_label = f"실행 중: {info.get('host')}:{info.get('port')}"
+                    self._show_status()
+                    if not save_settings({"agent_host": self.host_var.get(), "agent_port": self.port_var.get(), "agent_allowed_clients": self.allowed_var.get(), "agent_allegro_exe": self.exe_var.get(), "agent_workdir": self.workdir_var.get()}):
+                        self._write_log(f"설정을 저장하지 못했습니다: {settings_file()}")
                     self._sync_controls()
                     if self._closing:
                         self._stop(closing=True)
@@ -219,6 +262,7 @@ class AgentConsoleApp(ttk.Frame):
                     self.token_var.set("")
                     self.fingerprint_var.set("")
                     self._write_log("Agent 중지됨")
+                    self._running_label = ""
                     self.status_var.set("중지됨")
                     self._sync_controls()
                     if self._closing:
@@ -238,6 +282,7 @@ class AgentConsoleApp(ttk.Frame):
                             parent=self,
                         )
                     else:
+                        self._running_label = ""
                         self.status_var.set("시작 실패")
                         self._sync_controls()
                         if self._closing:
@@ -249,14 +294,29 @@ class AgentConsoleApp(ttk.Frame):
                             )
         except queue.Empty:
             pass
-        if not self._destroyed:
-            self._after_id = self.after(100, self._drain_events)
+        except Exception as exc:  # a UI-side failure must never stop the pump
+            self._busy = False
+            self._write_log("오류: " + str(exc))
+            self._write_log(traceback.format_exc())
+            self.status_var.set("오류")
+            self._sync_controls()
+            messagebox.showerror(APP_NAME, f"Agent 화면에서 오류가 발생했습니다.\n\n{exc}", parent=self)
+        finally:
+            if not self._destroyed:
+                self._after_id = self.after(100, self._drain_events)
+                self._status_ticks = (self._status_ticks + 1) % 10
+                if self._status_ticks == 0:  # about once a second, not every pump
+                    self._show_status()
+
+    def _show_status(self) -> None:
+        """Keep the running job count visible so nobody stops the agent blindly."""
+        if not self._running_label or self._busy or self._closing:
+            return
+        count = self.running_jobs
+        self.status_var.set(self._running_label + (f" · 실행 중 작업 {count}개" if count else ""))
 
     def _write_log(self, message: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", message.rstrip() + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        append_log(self.log, message)
 
 
 def main() -> None:

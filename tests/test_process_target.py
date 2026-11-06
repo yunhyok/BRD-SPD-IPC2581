@@ -4,6 +4,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -193,7 +194,8 @@ def test_dispatch_rechecks_process_and_window_immediately_before_send(tmp_path):
 
     process = ExitingProcess(executable)
     windows = FakeWindowAPI(eligible, process)
-    with pytest.raises(ProcessLookupError, match="exited before command dispatch"):
+    with pytest.raises(process_target.DispatchNotAttempted,
+                       match="exited before command dispatch"):
         process_target._dispatch_command_windows(
             77, executable, _identity(77, executable), "axlTest()",
             process_api=process, window_api=windows,
@@ -224,6 +226,81 @@ def test_dispatch_refuses_reused_identity_and_executable_mismatch(tmp_path):
         )
 
 
+@pytest.mark.parametrize("candidates,fragment", [
+    ([], "no eligible Allegro window"),
+    ([{"hwnd": 1, "pid": 77, "visible": True, "owner": 0, "title": "Allegro A"},
+      {"hwnd": 2, "pid": 77, "visible": True, "owner": 0, "title": "Allegro B"}],
+     "multiple eligible Allegro windows"),
+])
+def test_failures_before_the_send_are_reported_as_not_attempted(tmp_path, candidates, fragment):
+    executable = tmp_path / "allegro.exe"
+    executable.touch()
+    process = FakeProcessAPI(executable)
+    windows = FakeWindowAPI(candidates, process)
+    with pytest.raises(process_target.DispatchNotAttempted, match=fragment) as error:
+        process_target._dispatch_command_windows(
+            77, executable, _identity(77, executable), "axlTest()",
+            process_api=process, window_api=windows,
+        )
+    assert isinstance(error.value, RuntimeError)
+    assert not windows.sent
+    assert process.closed
+
+
+def test_enum_windows_reraises_callback_failure_instead_of_truncating():
+    class FakeDWORD:
+        def __init__(self):
+            self.value = 0
+
+    class FakeCtypes:
+        @staticmethod
+        def set_last_error(_value):
+            return None
+
+        @staticmethod
+        def get_last_error():
+            return 0
+
+        @staticmethod
+        def byref(value):
+            return value
+
+    class FakeUser32:
+        def __init__(self):
+            self.visited = []
+
+        def EnumWindows(self, callback, _lparam):
+            for hwnd in (1, 2, 3):
+                if not callback(hwnd, 0):
+                    break
+            return 1  # ctypes swallows callback errors and still reports success
+
+        def GetWindowThreadProcessId(self, hwnd, _process_id):
+            self.visited.append(hwnd)
+            if hwnd == 2:
+                raise OSError("window query failed")
+            return 1
+
+        def GetWindowTextLengthW(self, _hwnd):
+            return 0
+
+        def IsWindowVisible(self, _hwnd):
+            return True
+
+        def GetWindow(self, _hwnd, _flag):
+            return 0
+
+    api = process_target._WindowsMessageAPI.__new__(process_target._WindowsMessageAPI)
+    api.ctypes = FakeCtypes
+    api.wintypes = types.SimpleNamespace(DWORD=FakeDWORD)
+    api.user32 = FakeUser32()
+    api._enum_type = lambda function: function
+
+    with pytest.raises(OSError, match="window query failed"):
+        api.windows()
+    assert api.user32.visited == [1, 2]
+
+
 def test_dispatch_timeout_is_unknown_and_not_an_exception(tmp_path):
     executable = tmp_path / "allegro.exe"
     executable.touch()
@@ -240,7 +317,8 @@ def test_dispatch_timeout_is_unknown_and_not_an_exception(tmp_path):
 
 
 def test_dispatch_requires_prior_identity(tmp_path):
-    with pytest.raises(ValueError, match="expected_identity is required"):
+    with pytest.raises(process_target.DispatchNotAttempted,
+                       match="expected_identity is required"):
         process_target._dispatch_command_windows(
             77, tmp_path / "allegro.exe", None, "axlTest()",
             process_api=object(), window_api=object(),
